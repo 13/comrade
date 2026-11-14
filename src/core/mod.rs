@@ -1590,17 +1590,28 @@ mod tests {
     }
 
     #[test]
-    fn on_timer_never_opens_bootloader() {
+    fn bootloader_devices_never_opened_during_or_after_pause() {
         let mut c = core();
         foreign_open(&mut c, "/dev/ttyACM9", Holder::Unknown, 0);
-        c.handle(
-            Event::DeviceAdded(dev(0x2341, 0x0036, "B", "/dev/ttyACM0")),
+        // During the pause: Adafruit SAMD UF2 bootloader.
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x239a, 0x000b, "B1", "/dev/ttyACM0")),
             now(1),
         );
-        foreign_released(&mut c, "/dev/ttyACM9", 2);
-        let cmds = c.on_timer(now(502));
         assert!(opens(&cmds).is_empty());
+        foreign_released(&mut c, "/dev/ttyACM9", 2);
+        assert!(opens(&c.on_timer(now(502))).is_empty());
+        // After the pause: Seeed and Arduino SAMD bootloaders.
+        for (vid, pid, node) in [
+            (0x2886, 0x002f, "/dev/ttyACM1"),
+            (0x2341, 0x004d, "/dev/ttyACM2"),
+        ] {
+            let cmds = c.handle(Event::DeviceAdded(dev(vid, pid, "B2", node)), now(600));
+            assert!(opens(&cmds).is_empty());
+        }
+        assert!(opens(&c.on_timer(now(2000))).is_empty());
         assert!(c.tabs().is_empty());
+        assert_eq!(c.other_ports().len(), 3);
     }
 
     // ---- Task 5 review fixes ----

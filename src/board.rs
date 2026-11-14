@@ -37,23 +37,35 @@ pub enum Class {
     Other,
 }
 
+/// Arduino UART-bridge (16U2 / FTDI) PIDs under `2341` / `2a03`.
+const ARDUINO_BRIDGE_PIDS: [u16; 5] = [0x0043, 0x0001, 0x0243, 0x0010, 0x0042];
+/// SparkFun Caterina bootloaders (Pro Micro 3.3 V / 5 V, Fio v3). These have
+/// bit 15 set, so the high-bit rule below would not catch them.
+const SPARKFUN_BOOT_PIDS: [u16; 3] = [0x9203, 0x9205, 0x9207];
+
+/// Native-USB vendors that follow the Arduino PID convention: the
+/// application (CDC) PID has bit 15 set, the bootloader PID has it clear
+/// (Caterina `2341:0036`, SAMD `2341:004d`, Adafruit UF2/SAMD `239a:000b`,
+/// Seeed `2886:002f`, ...).
+fn by_high_bit(pid: u16) -> Class {
+    if pid & 0x8000 == 0 {
+        Class::Bootloader
+    } else {
+        Class::Auto(Family::NativeCdc)
+    }
+}
+
 pub fn classify(vid: u16, pid: u16) -> Class {
     match vid {
-        0x10c4 | 0x1a86 | 0x0403 | 0x2a03 | 0x0483 => Class::Auto(Family::UartBridge),
-        0x2341 => match pid {
-            0x0043 | 0x0001 | 0x0243 | 0x0010 | 0x0042 => Class::Auto(Family::UartBridge),
-            0x0036 | 0x0037 => Class::Bootloader,
-            _ => Class::Auto(Family::NativeCdc),
-        },
+        0x10c4 | 0x1a86 | 0x0403 | 0x0483 => Class::Auto(Family::UartBridge),
+        0x2341 | 0x2a03 if ARDUINO_BRIDGE_PIDS.contains(&pid) => Class::Auto(Family::UartBridge),
+        0x1b4f if SPARKFUN_BOOT_PIDS.contains(&pid) => Class::Bootloader,
+        0x2341 | 0x2a03 | 0x239a | 0x1b4f | 0x2886 => by_high_bit(pid),
         0x303a => match pid {
             0x1001 => Class::Auto(Family::EspUsbJtag),
             _ => Class::Auto(Family::NativeCdc),
         },
-        0x1b4f => match pid {
-            0x9205 | 0x9207 => Class::Bootloader,
-            _ => Class::Auto(Family::NativeCdc),
-        },
-        0x2e8a | 0x239a | 0x2886 | 0x16c0 => Class::Auto(Family::NativeCdc),
+        0x2e8a | 0x16c0 => Class::Auto(Family::NativeCdc),
         _ => Class::Other,
     }
 }
@@ -143,8 +155,38 @@ mod tests {
         assert_eq!(classify(0x1a86, 0x7523), Class::Auto(Family::UartBridge));
         assert_eq!(classify(0x303a, 0x0002), Class::Auto(Family::NativeCdc));
         assert_eq!(classify(0x1b4f, 0x9205), Class::Bootloader);
-        assert_eq!(classify(0x1b4f, 0x0001), Class::Auto(Family::NativeCdc));
+        assert_eq!(classify(0x1b4f, 0x0001), Class::Bootloader);
         assert_eq!(classify(0x2e8a, 0x000a), Class::Auto(Family::NativeCdc));
+    }
+    #[test]
+    fn bootloader_pids_by_high_bit() {
+        // I6: SAMD/Adafruit/Seeed/SparkFun bootloaders have bit 15 clear.
+        assert_eq!(classify(0x2341, 0x004d), Class::Bootloader);
+        assert_eq!(classify(0x239a, 0x000b), Class::Bootloader);
+        assert_eq!(classify(0x2886, 0x002f), Class::Bootloader);
+        assert_eq!(classify(0x2341, 0x804d), Class::Auto(Family::NativeCdc));
+        assert_eq!(classify(0x239a, 0x800b), Class::Auto(Family::NativeCdc));
+        assert_eq!(classify(0x2886, 0x802f), Class::Auto(Family::NativeCdc));
+        assert_eq!(classify(0x1b4f, 0x9206), Class::Auto(Family::NativeCdc));
+    }
+    #[test]
+    fn uart_bridge_pids_win_over_high_bit_rule() {
+        for pid in [0x0043, 0x0001, 0x0243, 0x0010, 0x0042] {
+            assert_eq!(classify(0x2341, pid), Class::Auto(Family::UartBridge));
+            assert_eq!(classify(0x2a03, pid), Class::Auto(Family::UartBridge));
+        }
+    }
+    #[test]
+    fn arduino_org_vid_classified_like_arduino_cc() {
+        assert_eq!(classify(0x2a03, 0x0036), Class::Bootloader);
+        assert_eq!(classify(0x2a03, 0x8036), Class::Auto(Family::NativeCdc));
+    }
+    #[test]
+    fn sparkfun_explicit_bootloaders_kept() {
+        // Pro Micro 3.3 V / 5 V and Fio v3 Caterina PIDs have bit 15 set.
+        for pid in [0x9203, 0x9205, 0x9207] {
+            assert_eq!(classify(0x1b4f, pid), Class::Bootloader);
+        }
     }
     #[test]
     fn policies() {

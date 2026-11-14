@@ -117,14 +117,14 @@ When Linux opens a serial port, the kernel raises both DTR and RTS. Right after 
 
 | Family | Examples (VID:PID) | DTR | RTS | Why |
 |---|---|---|---|---|
-| UART bridge | CP210x `10c4`, CH340 `1a86`, FTDI `0403`, Uno/Mega 16U2 `2341:0043/0001/0010/0042/0243`, `2a03`, ST-Link `0483` | off | off | On ESP32 boards with the two-transistor auto-reset circuit, DTR on with RTS off pulls IO0 low. The reset button would then start download mode. |
+| UART bridge | CP210x `10c4`, CH340 `1a86`, FTDI `0403`, Uno/Mega 16U2 `2341:0043/0001/0010/0042/0243` and the same PIDs under `2a03`, ST-Link `0483` | off | off | On ESP32 boards with the two-transistor auto-reset circuit, DTR on with RTS off pulls IO0 low. The reset button would then start download mode. |
 | ESP USB-Serial-JTAG | `303a:1001` (built into ESP32-S3, C3 and C6) | off | off | RTS on holds the chip in reset. |
-| Native USB CDC | Leonardo, Micro and other `2341` CDC PIDs; SparkFun `1b4f`; RP2040 `2e8a`; Adafruit `239a`; Seeed `2886`; Teensy `16c0`; other Espressif `303a` PIDs (TinyUSB) | on | off | These USB stacks treat DTR as "host is listening". Without it, `while (!Serial)` sketches and TinyUSB print nothing. |
+| Native USB CDC | Leonardo, Micro, Zero and other `2341`/`2a03` CDC PIDs (bit 15 set, e.g. `8036`, `804d`); SparkFun `1b4f`, Adafruit `239a` and Seeed `2886` PIDs with bit 15 set; RP2040 `2e8a`; Teensy `16c0`; other Espressif `303a` PIDs (TinyUSB) | on | off | These USB stacks treat DTR as "host is listening". Without it, `while (!Serial)` sketches and TinyUSB print nothing. |
 | Unknown / manual (`--port`, `c`) | anything else | on | off | Same as the pyserial and miniterm default. |
 
 **An Uno (or a Nano with a DTR reset capacitor) resets once when comrade connects.** The DTR edge on open does this, just as in the Arduino IDE serial monitor. You get the boot output from the start.
 
-comrade never auto-connects known bootloader PIDs: Caterina `2341:0036/0037` and SparkFun `1b4f:9205/9207`. They appear only under `c`.
+comrade never auto-connects bootloader PIDs. For Arduino (`2341`, `2a03`), SparkFun (`1b4f`), Adafruit (`239a`) and Seeed (`2886`), every PID with bit 15 clear counts as a bootloader (for example Caterina `2341:0036`, Arduino SAMD `2341:004d`, Adafruit UF2 `239a:000b`, Seeed `2886:002f`), except the Arduino UART-bridge PIDs listed above. The SparkFun Caterina PIDs `1b4f:9203/9205/9207` are bootloaders too. Bootloader ports appear only under `c`.
 
 What `r` does depends on the family:
 
