@@ -252,13 +252,12 @@ fn set_baud(fd: &OwnedFd, baud: u32) -> Result<(), String> {
         .map_err(|e| format!("TCSETS2: {e}"))
 }
 
-/// Sets data bits, parity and stop bits. The baud rate is left as it is.
-fn set_format(fd: &OwnedFd, format: SerialFormat) -> Result<(), String> {
-    let mut t = termios::tcgetattr(fd).map_err(|e| format!("tcgetattr: {e}"))?;
-    t.control_flags.remove(
+/// `flags` with the data bits, parity and stop bits of `format`.
+fn format_flags(mut flags: ControlFlags, format: SerialFormat) -> ControlFlags {
+    flags.remove(
         ControlFlags::CSIZE | ControlFlags::PARENB | ControlFlags::PARODD | ControlFlags::CSTOPB,
     );
-    t.control_flags |= match format.data_bits {
+    flags |= match format.data_bits {
         5 => ControlFlags::CS5,
         6 => ControlFlags::CS6,
         7 => ControlFlags::CS7,
@@ -266,12 +265,19 @@ fn set_format(fd: &OwnedFd, format: SerialFormat) -> Result<(), String> {
     };
     match format.parity {
         Parity::None => {}
-        Parity::Even => t.control_flags |= ControlFlags::PARENB,
-        Parity::Odd => t.control_flags |= ControlFlags::PARENB | ControlFlags::PARODD,
+        Parity::Even => flags |= ControlFlags::PARENB,
+        Parity::Odd => flags |= ControlFlags::PARENB | ControlFlags::PARODD,
     }
     if format.stop_bits == 2 {
-        t.control_flags |= ControlFlags::CSTOPB;
+        flags |= ControlFlags::CSTOPB;
     }
+    flags
+}
+
+/// Sets data bits, parity and stop bits. The baud rate is left as it is.
+fn set_format(fd: &OwnedFd, format: SerialFormat) -> Result<(), String> {
+    let mut t = termios::tcgetattr(fd).map_err(|e| format!("tcgetattr: {e}"))?;
+    t.control_flags = format_flags(t.control_flags, format);
     // Parity is not checked on input (INPCK off), so a byte with a bad
     // parity bit still reaches the log instead of being dropped or marked.
     t.input_flags
@@ -565,6 +571,26 @@ fn run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn format_flags_sets_bits() {
+        use super::*;
+        let base = ControlFlags::CREAD | ControlFlags::CLOCAL | ControlFlags::CS8;
+        let f = format_flags(base, SerialFormat::new(7, Parity::Even, 1));
+        assert_eq!(f & ControlFlags::CSIZE, ControlFlags::CS7);
+        assert!(f.contains(ControlFlags::PARENB) && !f.contains(ControlFlags::PARODD));
+        assert!(!f.contains(ControlFlags::CSTOPB));
+        let f = format_flags(f, SerialFormat::new(8, Parity::Odd, 2));
+        assert_eq!(f & ControlFlags::CSIZE, ControlFlags::CS8);
+        assert!(f.contains(ControlFlags::PARENB | ControlFlags::PARODD | ControlFlags::CSTOPB));
+        let f = format_flags(f, SerialFormat::default());
+        assert_eq!(f & ControlFlags::CSIZE, ControlFlags::CS8);
+        assert!(!f.intersects(ControlFlags::PARENB | ControlFlags::PARODD | ControlFlags::CSTOPB));
+        assert!(
+            f.contains(ControlFlags::CREAD | ControlFlags::CLOCAL),
+            "other flags kept"
+        );
+    }
+
     use super::*;
     use nix::libc::{TIOCM_CTS, TIOCM_DTR, TIOCM_RTS};
 
