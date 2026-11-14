@@ -2,6 +2,8 @@
 name = "comrade"
 version = "0.1.0"
 edition = "2024"
+# No license chosen yet; keeps the crate off crates.io and out of cargo-deny's license check.
+publish = false
 
 [dependencies]
 ansi-to-tui = "8.0.1"
@@ -22,3 +24,10 @@ unicode-width = "0.2.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# No `panic = "abort"`: worker-thread panics are caught and shown in the
+# status line (app.rs), which needs unwinding.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
