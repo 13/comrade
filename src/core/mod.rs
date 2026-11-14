@@ -4,7 +4,7 @@ mod pause;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::board::{
     BoardKey, Class, DeviceInfo, Family, LinePolicy, board_key, board_key_at_path, classify,
@@ -18,6 +18,10 @@ use pause::PauseTracker;
 
 const SCROLLBACK_CAP: usize = 100_000;
 const BANNER_QUIET: u8 = 8;
+/// First reconnect retry after a lost connection; doubles per failure.
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+/// Longest gap between reconnect retries.
+const RETRY_MAX: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PauseReason {
@@ -57,6 +61,15 @@ pub struct Tab {
     /// Set when an upload pause begins: the next `PortOpened` adds no
     /// `reconnected` separator (the `upload` one already marks the gap).
     after_upload: bool,
+    /// When `on_timer` retries a lost or not-yet-present port.
+    retry_at: Option<Instant>,
+    /// Delay before the next retry (1 s doubling, capped at 5 s).
+    backoff: Duration,
+    /// Waiting only because auto-connect was blocked (upload pause or a
+    /// retry that fell inside one): `on_timer` opens it once allowed.
+    await_unblock: bool,
+    /// The "not present" info line was already shown for this streak.
+    missing_noted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -156,46 +169,52 @@ impl Core {
         self.other.iter().collect()
     }
 
-    /// Called when `next_deadline` passes: once auto-connect is allowed again,
-    /// open every present Auto board whose tab is waiting (or missing).
+    /// Called when `next_deadline` passes. Every reopen here is deliberate:
+    /// a tab that waited out an upload block (`await_unblock`) or whose
+    /// reconnect retry is due (`retry_at`). A retry is an auto-connect, so
+    /// during a global upload block it waits for the block to lift.
     pub fn on_timer(&mut self, now: Now) -> Vec<Command> {
         let mut cmds = Vec::new();
         self.pause.on_timer(now.mono);
-        if self.pause.allows_auto_connect(now.mono) {
-            for dev in self.present_auto.clone() {
-                let Class::Auto(family) = classify(dev.vid, dev.pid) else {
-                    continue;
-                };
-                let key = self.key_of(&dev);
-                if self.suppressed.contains(&key)
-                    || self.owned_by_other(&key, &dev.devnode)
-                    || self.pause.is_held(&dev.devnode)
-                {
-                    continue;
-                }
-                let idx = self.find_or_create(key, friendly_name(&dev), family, now);
-                if self.tabs[idx].state == TabState::Waiting {
-                    self.open_tab(idx, Some(dev.devnode), &mut cmds);
-                }
+        let allowed = self.pause.allows_auto_connect(now.mono);
+        for idx in 0..self.tabs.len() {
+            let t = &mut self.tabs[idx];
+            if t.retry_at.is_some_and(|r| r <= now.mono) {
+                t.retry_at = None;
+                t.await_unblock = true;
             }
-            // `--port` and `c` tabs are not udev-tracked: after an upload
-            // pause they wait here with their node kept (see
-            // `foreign_released`) and reopen once the quiet period is over.
-            for idx in 0..self.tabs.len() {
-                let t = &self.tabs[idx];
-                let resumable = t.family == Family::Unknown
-                    && t.state == TabState::Waiting
-                    && t.devnode.as_ref().is_some_and(|n| !self.pause.is_held(n));
-                if resumable {
-                    self.open_tab(idx, None, &mut cmds);
-                }
+            if !t.await_unblock || !allowed {
+                continue;
             }
+            if t.state != TabState::Waiting {
+                t.await_unblock = false;
+                continue;
+            }
+            let Some(node) = t.devnode.clone() else {
+                t.await_unblock = false;
+                continue;
+            };
+            // Held: the holder's release brings a quiet deadline and us back.
+            if self.pause.is_held(&node) {
+                continue;
+            }
+            // udev-tracked boards only while their node is present. `--port`
+            // and `c` tabs just try; a missing node fails with NotPresent.
+            if t.family != Family::Unknown && !self.present_auto.iter().any(|d| d.devnode == node) {
+                t.await_unblock = false;
+                continue;
+            }
+            self.open_tab(idx, None, &mut cmds);
         }
         self.finish(cmds)
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.pause.deadline()
+        self.tabs
+            .iter()
+            .filter_map(|t| t.retry_at)
+            .chain(self.pause.deadline())
+            .min()
     }
 
     /// Open the `--port` ports as tabs.
@@ -230,23 +249,38 @@ impl Core {
                         t.banner_quiet = BANNER_QUIET;
                     }
                     t.ever_connected = true;
+                    t.missing_noted = false;
                 }
             }
             Event::PortOpenFailed { key, conn, err } => {
                 if let Some(i) = self.matching(&key, conn) {
                     let t = &mut self.tabs[i];
+                    let dev = t
+                        .devnode
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
                     let msg = match err {
-                        OpenError::PermissionDenied { group } => {
-                            let dev = t
-                                .devnode
-                                .as_ref()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_default();
-                            format!(
-                                "no permission for {dev} — add yourself to group '{group}' and re-login"
-                            )
-                        }
+                        OpenError::PermissionDenied { group } => format!(
+                            "no permission for {dev} — add yourself to group '{group}' and re-login"
+                        ),
                         OpenError::Other(m) => m,
+                        OpenError::NotPresent => {
+                            // Not an error: the node is missing (a --port
+                            // path not created yet, or gone meanwhile).
+                            if !t.missing_noted {
+                                t.missing_noted = true;
+                                t.scroll.push(line(
+                                    now,
+                                    LineKind::Info,
+                                    format!("{dev} not present, waiting"),
+                                ));
+                            }
+                            t.state = TabState::Waiting;
+                            t.conn = 0;
+                            Self::schedule_retry(t, now);
+                            return self.finish(cmds);
+                        }
                     };
                     t.scroll.push(line(now, LineKind::Error, msg.clone()));
                     t.state = TabState::Error(msg);
@@ -257,14 +291,26 @@ impl Core {
                     self.port_data(i, &bytes, now);
                 }
             }
-            Event::PortGone { key, conn, .. } => {
+            Event::PortGone { key, conn, reason } => {
                 if let Some(i) = self.matching(&key, conn) {
                     let t = &mut self.tabs[i];
                     Self::flush_partial(t);
+                    t.scroll.push(line(
+                        now,
+                        LineKind::Info,
+                        format!("connection lost: {reason}"),
+                    ));
+                    // devnode kept: a board that is still present (I/O
+                    // error, dead worker) is retried; an unplug clears it.
                     t.state = TabState::Waiting;
-                    t.devnode = None;
                     t.conn = 0;
+                    Self::schedule_retry(t, now);
                     cmds.push(Command::Close { key });
+                }
+            }
+            Event::PortWarning { key, conn, msg } => {
+                if let Some(i) = self.matching(&key, conn) {
+                    self.tabs[i].scroll.push(line(now, LineKind::Info, msg));
                 }
             }
             Event::ForeignOpen { devnode, holder } => {
@@ -390,6 +436,11 @@ impl Core {
         }
     }
 
+    fn schedule_retry(t: &mut Tab, now: Now) {
+        t.retry_at = Some(now.mono + t.backoff);
+        t.backoff = (t.backoff * 2).min(RETRY_MAX);
+    }
+
     fn find_or_create(&mut self, key: BoardKey, name: String, family: Family, _now: Now) -> usize {
         if let Some(i) = self.tabs.iter().position(|t| t.key == key) {
             return i;
@@ -420,6 +471,10 @@ impl Core {
             banner_quiet: 0,
             upload_node: None,
             after_upload: false,
+            retry_at: None,
+            backoff: RETRY_FIRST,
+            await_unblock: false,
+            missing_noted: false,
         });
         let idx = self.tabs.len() - 1;
         if self.tabs.len() > 1 && focused_connected {
@@ -443,6 +498,8 @@ impl Core {
         t.conn = conn;
         t.state = TabState::Connecting;
         t.data_this_conn = false;
+        t.retry_at = None;
+        t.await_unblock = false;
         let policy: LinePolicy = line_policy(t.family);
         cmds.push(Command::Open {
             key: t.key.clone(),
@@ -494,6 +551,9 @@ impl Core {
         let held = self.pause.is_held(&devnode);
         let can_open = !held && self.pause.allows_auto_connect(now.mono);
         let t = &mut self.tabs[idx];
+        // The device (re)appeared: start the retry backoff afresh.
+        t.backoff = RETRY_FIRST;
+        t.retry_at = None;
         let same_node = t.devnode.as_ref() == Some(&devnode);
         match t.state {
             TabState::Connecting | TabState::Connected if same_node => {}
@@ -506,6 +566,7 @@ impl Core {
             _ => {
                 t.devnode = Some(devnode);
                 t.state = TabState::Waiting;
+                t.await_unblock = true;
             }
         }
     }
@@ -559,6 +620,8 @@ impl Core {
         else {
             return;
         };
+        t.retry_at = None;
+        t.await_unblock = false;
         match t.state {
             TabState::Connecting | TabState::Connected => {
                 Self::flush_partial(t);
@@ -611,6 +674,8 @@ impl Core {
         }
         t.state = TabState::Paused(PauseReason::Upload(holder));
         t.upload_node = Some(devnode);
+        t.retry_at = None;
+        t.await_unblock = false;
     }
 
     fn foreign_released(&mut self, devnode: PathBuf, now: Now, cmds: &mut Vec<Command>) {
@@ -636,6 +701,7 @@ impl Core {
                 // wait for the quiet period and `on_timer` (devnode kept).
                 // Also: node vanished (re-enumeration, failed upload, unplug).
                 t.state = TabState::Waiting;
+                t.await_unblock = true;
             }
         }
     }
@@ -661,6 +727,8 @@ impl Core {
         }
         if !bytes.is_empty() {
             t.data_this_conn = true;
+            // A connection that delivers data counts as healthy.
+            t.backoff = RETRY_FIRST;
         }
     }
 
@@ -1869,6 +1937,186 @@ mod tests {
         assert_eq!(c.tabs().len(), 2);
         assert_eq!(c.tabs()[1].devnode, Some("/dev/ttyUSB2".into()));
         assert_eq!(c.tabs()[0].state, TabState::Connected);
+    }
+
+    fn gone(c: &mut Core, key: &BoardKey, conn: ConnId, ms: u64) -> Vec<Command> {
+        c.handle(
+            Event::PortGone {
+                key: key.clone(),
+                conn,
+                reason: "read: EBADF".into(),
+            },
+            now(ms),
+        )
+    }
+
+    /// The next retry: nothing before `at`, one Open at `at`.
+    fn retry_at(c: &mut Core, at: u64) -> ConnId {
+        assert_eq!(c.next_deadline(), Some(now(at).mono));
+        assert!(opens(&c.on_timer(now(at - 1))).is_empty());
+        let o = opens(&c.on_timer(now(at)));
+        assert_eq!(o.len(), 1);
+        o[0].0
+    }
+
+    #[test]
+    fn port_gone_on_present_board_retries_with_backoff() {
+        let mut c = core();
+        let (key, conn) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        let cmds = gone(&mut c, &key, conn, 10);
+        assert!(cmds.contains(&Command::Close { key: key.clone() }));
+        let t = &c.tabs()[0];
+        assert_eq!(t.state, TabState::Waiting);
+        assert_eq!(t.devnode, Some("/dev/ttyUSB0".into()));
+        let last = t.scroll.get(t.scroll.len() - 1).unwrap();
+        assert_eq!(last.text, "connection lost: read: EBADF");
+        assert_eq!(last.kind, LineKind::Info);
+        // 1 s, 2 s, 4 s, then capped at 5 s.
+        let mut at = 10;
+        for delay in [1000, 2000, 4000, 5000, 5000] {
+            at += delay;
+            let conn = retry_at(&mut c, at);
+            assert_eq!(c.tabs()[0].state, TabState::Connecting);
+            at += 5;
+            gone(&mut c, &key, conn, at);
+        }
+        // A connection that delivers data resets the backoff.
+        at += 5000;
+        let conn = retry_at(&mut c, at);
+        c.handle(
+            Event::PortOpened {
+                key: key.clone(),
+                conn,
+            },
+            now(at + 1),
+        );
+        data(&mut c, &key, conn, b"hi\r\n");
+        gone(&mut c, &key, conn, at + 10);
+        retry_at(&mut c, at + 1010);
+    }
+
+    #[test]
+    fn device_added_resets_backoff() {
+        let mut c = core();
+        let d = dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0");
+        let (key, conn) = connect(&mut c, d.clone());
+        gone(&mut c, &key, conn, 10);
+        let conn = retry_at(&mut c, 1010);
+        gone(&mut c, &key, conn, 1020);
+        removed(&mut c, "/dev/ttyUSB0", 1030);
+        assert_eq!(c.next_deadline(), None);
+        let conn = opens(&c.handle(Event::DeviceAdded(d), now(1040)))[0].0;
+        gone(&mut c, &key, conn, 1050);
+        retry_at(&mut c, 2050);
+    }
+
+    #[test]
+    fn no_retry_once_board_is_unplugged() {
+        let mut c = core();
+        let (key, conn) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        gone(&mut c, &key, conn, 10);
+        removed(&mut c, "/dev/ttyUSB0", 20);
+        assert!(opens(&c.on_timer(now(1010))).is_empty());
+        assert_eq!(c.tabs()[0].state, TabState::Waiting);
+        assert_eq!(c.next_deadline(), None);
+    }
+
+    #[test]
+    fn retry_waits_for_global_upload_block() {
+        let mut c = core();
+        let (key, conn) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        gone(&mut c, &key, conn, 0);
+        foreign_open(&mut c, "/dev/ttyACM5", esptool(), 500);
+        assert!(opens(&c.on_timer(now(1000))).is_empty());
+        foreign_released(&mut c, "/dev/ttyACM5", 3000);
+        assert_eq!(c.next_deadline(), Some(now(3500).mono));
+        assert_eq!(opens(&c.on_timer(now(3500))).len(), 1);
+    }
+
+    #[test]
+    fn retry_skips_held_node() {
+        let mut c = core();
+        let (key, conn) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        gone(&mut c, &key, conn, 0);
+        // A holder appears on the node while the tab waits for its retry.
+        foreign_open(&mut c, "/dev/ttyUSB0", esptool(), 500);
+        assert!(opens(&c.on_timer(now(1000))).is_empty());
+        assert!(opens(&c.on_timer(now(60_000))).is_empty());
+    }
+
+    #[test]
+    fn manual_pause_is_not_retried() {
+        let mut c = core();
+        let (key, conn) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        gone(&mut c, &key, conn, 0);
+        c.action(Action::TogglePause, now(10)); // resume: reopens now
+        c.action(Action::TogglePause, now(20)); // pause again
+        assert!(opens(&c.on_timer(now(1000))).is_empty());
+        assert_eq!(c.tabs()[0].state, TabState::Paused(PauseReason::Manual));
+    }
+
+    #[test]
+    fn on_timer_does_not_reopen_unrelated_waiting_tab() {
+        let mut c = core();
+        let (key, conn) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        gone(&mut c, &key, conn, 0);
+        // Another node's upload ends with a quiet deadline before A's retry.
+        foreign_open(&mut c, "/dev/ttyACM5", esptool(), 10);
+        foreign_released(&mut c, "/dev/ttyACM5", 20);
+        assert_eq!(c.next_deadline(), Some(now(520).mono));
+        assert!(opens(&c.on_timer(now(520))).is_empty());
+        assert_eq!(opens(&c.on_timer(now(1000))).len(), 1);
+    }
+
+    #[test]
+    fn missing_manual_port_waits_and_retries() {
+        let mut c = Core::new(HashMap::new(), 115_200, vec!["/tmp/cmrd-missing".into()]);
+        let conn = opens(&c.startup(now(0)))[0].0;
+        let key = c.tabs()[0].key.clone();
+        c.handle(
+            Event::PortOpenFailed {
+                key: key.clone(),
+                conn,
+                err: OpenError::NotPresent,
+            },
+            now(1),
+        );
+        assert_eq!(c.tabs()[0].state, TabState::Waiting);
+        assert_eq!(c.tabs()[0].devnode, Some("/tmp/cmrd-missing".into()));
+        let o = opens(&c.on_timer(now(1001)));
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].1, PathBuf::from("/tmp/cmrd-missing"));
+        // Still missing: the next retry backs off; one info line, not one per try.
+        c.handle(
+            Event::PortOpenFailed {
+                key,
+                conn: o[0].0,
+                err: OpenError::NotPresent,
+            },
+            now(1002),
+        );
+        assert_eq!(c.next_deadline(), Some(now(3002).mono));
+        assert_eq!(c.tabs()[0].scroll.len(), 1);
+    }
+
+    #[test]
+    fn port_warning_is_an_info_line() {
+        let mut c = core();
+        let (key, conn) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        let cmds = c.handle(
+            Event::PortWarning {
+                key,
+                conn,
+                msg: "write timed out, 12 bytes dropped".into(),
+            },
+            now(5),
+        );
+        assert!(cmds.is_empty());
+        let t = &c.tabs()[0];
+        assert_eq!(t.state, TabState::Connected);
+        let l = t.scroll.get(0).unwrap();
+        assert_eq!(l.text, "write timed out, 12 bytes dropped");
+        assert_eq!(l.kind, LineKind::Info);
     }
 
     #[test]

@@ -774,15 +774,53 @@ mod tests {
     }
 
     #[test]
-    fn app_open_failure_shows_error() {
+    fn app_missing_port_waits_and_schedules_retry() {
         let _g = serial();
         let mut r = rig(vec!["/nonexistent/ttyX".into()], None);
-        assert!(r.until(Duration::from_secs(2), |a| matches!(
-            a.core.tabs()[0].state,
-            TabState::Error(_)
-        )));
-        assert!(r.app.ports.is_empty());
+        assert!(r.until(Duration::from_secs(2), |a| a.core.tabs()[0].state
+            == TabState::Waiting
+            && a.ports.is_empty()));
+        assert!(r.app.core.next_deadline().is_some());
         assert!(!r.app.should_quit());
+    }
+
+    #[test]
+    fn app_open_failure_shows_error() {
+        let (tx, _rx) = unbounded();
+        let core = Core::new(HashMap::new(), 115_200, vec!["/dev/ttyX".into()]);
+        let mut app = App::new(core, None, tx, None);
+        let key = app.core.tabs()[0].key.clone();
+        app.handle_event(
+            Event::PortOpenFailed {
+                key,
+                conn: 1,
+                err: crate::event::OpenError::Other("boom".into()),
+            },
+            now(),
+        );
+        assert!(matches!(app.core.tabs()[0].state, TabState::Error(_)));
+        assert!(app.ports.is_empty());
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn app_next_wake_includes_retry_deadline() {
+        let (tx, _rx) = unbounded();
+        let core = Core::new(HashMap::new(), 115_200, vec!["/dev/ttyX".into()]);
+        let mut app = App::new(core, None, tx, None);
+        let key = app.core.tabs()[0].key.clone();
+        let t = now();
+        app.handle_event(
+            Event::PortGone {
+                key,
+                conn: 1,
+                reason: "x".into(),
+            },
+            t,
+        );
+        app.dirty = false;
+        app.next_rate = t.mono + Duration::from_secs(10);
+        assert_eq!(app.next_wake(), Some(t.mono + Duration::from_secs(1)));
     }
 
     #[test]

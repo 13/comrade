@@ -18,7 +18,11 @@ pub enum Holder {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum OpenError {
-    PermissionDenied { group: String },
+    PermissionDenied {
+        group: String,
+    },
+    /// ENOENT / ENODEV / ENXIO: the node is not there (yet). The tab waits.
+    NotPresent,
     Other(String),
 }
 
@@ -45,6 +49,13 @@ pub enum Event {
         key: BoardKey,
         conn: ConnId,
         reason: String,
+    },
+    /// Something went wrong but the port stays open (e.g. a write timed
+    /// out and its bytes were dropped). Shown as an info line.
+    PortWarning {
+        key: BoardKey,
+        conn: ConnId,
+        msg: String,
     },
     ForeignOpen {
         devnode: PathBuf,

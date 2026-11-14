@@ -160,7 +160,7 @@ fn write_after_unplug_reports_gone() {
 fn bad_path_reports_open_failed() {
     let (_h, rx) = start(std::path::Path::new("/dev/does-not-exist-comrade"));
     match rx.recv_timeout(WAIT).expect("event") {
-        Event::PortOpenFailed { err, .. } => assert!(matches!(err, OpenError::Other(_))),
+        Event::PortOpenFailed { err, .. } => assert_eq!(err, OpenError::NotPresent),
         _ => panic!("expected PortOpenFailed"),
     }
 }
@@ -251,5 +251,41 @@ fn receiver_dropped_stops_worker() {
     drop(rx);
     nix::unistd::write(&pty.master, b"data").unwrap();
     assert_fd_released_within_50ms(&pty.path);
+    drop(h);
+}
+
+#[test]
+fn stuck_write_warns_and_keeps_port_open() {
+    let pty = make_pty();
+    let (h, rx) = start(&pty.path);
+    expect_opened(&rx);
+    // master is never read: the pty buffer fills and the write times out
+    for _ in 0..16 {
+        h.write(vec![b'a'; 64 * 1024]);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left).expect("PortWarning within 5 s") {
+            Event::PortWarning { conn, msg, .. } => {
+                assert_eq!(conn, 7);
+                assert!(msg.contains("timed out"), "{msg}");
+                break;
+            }
+            Event::PortGone { reason, .. } => panic!("PortGone: {reason}"),
+            _ => {}
+        }
+    }
+    // still alive: reads keep flowing and the fd stays open
+    assert!(fd_open_to(&pty.path));
+    nix::unistd::write(&pty.master, b"alive").unwrap();
+    let mut got = Vec::new();
+    while !got.windows(5).any(|w| w == b"alive") {
+        match rx.recv_timeout(WAIT).expect("data after warning") {
+            Event::PortData { bytes, .. } => got.extend(bytes),
+            Event::PortGone { reason, .. } => panic!("PortGone: {reason}"),
+            _ => {}
+        }
+    }
     drop(h);
 }

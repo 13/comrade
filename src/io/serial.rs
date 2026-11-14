@@ -259,27 +259,26 @@ fn configure(fd: &OwnedFd) -> Result<(), String> {
     termios::tcsetattr(fd, SetArg::TCSANOW, &t).map_err(|e| format!("tcsetattr: {e}"))
 }
 
-fn open_port(devnode: &Path, baud: u32, policy: LinePolicy) -> Result<OwnedFd, OpenError> {
-    match access(devnode, AccessFlags::R_OK | AccessFlags::W_OK) {
-        Ok(()) => {}
-        Err(Errno::EACCES) => {
-            return Err(OpenError::PermissionDenied {
-                group: group_name(devnode),
-            });
-        }
-        Err(e) => return Err(OpenError::Other(format!("{}: {e}", devnode.display()))),
+/// Maps an access/open errno: a missing node is `NotPresent` (the tab
+/// waits and retries), EACCES is a permission problem, the rest is an error.
+fn open_error(devnode: &Path, e: Errno) -> OpenError {
+    match e {
+        Errno::ENOENT | Errno::ENODEV | Errno::ENXIO => OpenError::NotPresent,
+        Errno::EACCES => OpenError::PermissionDenied {
+            group: group_name(devnode),
+        },
+        e => OpenError::Other(format!("{}: {e}", devnode.display())),
     }
+}
+
+fn open_port(devnode: &Path, baud: u32, policy: LinePolicy) -> Result<OwnedFd, OpenError> {
+    access(devnode, AccessFlags::R_OK | AccessFlags::W_OK).map_err(|e| open_error(devnode, e))?;
     let fd = open(
         devnode,
         OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|e| match e {
-        Errno::EACCES => OpenError::PermissionDenied {
-            group: group_name(devnode),
-        },
-        e => OpenError::Other(format!("{}: {e}", devnode.display())),
-    })?;
+    .map_err(|e| open_error(devnode, e))?;
     configure(&fd).map_err(OpenError::Other)?;
     // A baud the driver rejects must not make the open fail; the port stays
     // at 115200 (the placeholder rate set by `configure`).
@@ -481,8 +480,20 @@ fn run(
                     Err(e) => return gone(format!("write: {e}")),
                 }
             }
+            // A stuck write (no CTS, full buffer) drops what is pending but
+            // keeps the port: reading must go on.
             if !wbuf.is_empty() && write_deadline.is_some_and(|d| Instant::now() >= d) {
-                return gone("write: timed out".into());
+                let dropped = wbuf.len();
+                wbuf.clear();
+                write_deadline = None;
+                let ev = Event::PortWarning {
+                    key: key.clone(),
+                    conn,
+                    msg: format!("write timed out, {dropped} bytes dropped"),
+                };
+                if tx.send(ev).is_err() {
+                    return; // receiver gone
+                }
             }
         }
     }
@@ -511,6 +522,19 @@ mod tests {
             TIOCM_CTS | TIOCM_RTS
         );
         assert_eq!(target_modem_bits(TIOCM_RTS, p(true, false)), TIOCM_DTR);
+    }
+
+    #[test]
+    fn missing_node_errnos_map_to_not_present() {
+        let p = Path::new("/dev/ttyACM0");
+        for e in [Errno::ENOENT, Errno::ENODEV, Errno::ENXIO] {
+            assert_eq!(open_error(p, e), OpenError::NotPresent);
+        }
+        assert!(matches!(
+            open_error(p, Errno::EACCES),
+            OpenError::PermissionDenied { .. }
+        ));
+        assert!(matches!(open_error(p, Errno::EBUSY), OpenError::Other(_)));
     }
 
     #[test]

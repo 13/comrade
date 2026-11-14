@@ -194,7 +194,9 @@ comrade never needs root.
 ## Robustness
 
 - comrade does not exit on device events or I/O errors. A port that fails shows `!` or `○`, and comrade keeps running.
-- If a port worker crashes, comrade treats it as an unplug and reconnects through the normal path.
+- If a connection drops while the board is still plugged in (an I/O error, or a crashed port worker), the tab shows `connection lost: <reason>`, goes to `○` and comrade retries. The first retry comes after 1 s, and the gap doubles up to 5 s. A connection that delivers data, or a replug, starts the backoff again. comrade does not retry while the port is held by another program, while you paused the tab with `p`, or while an upload pause blocks auto-connect.
+- A missing node (`ENOENT`, `ENODEV`, `ENXIO`) is not an error: the tab shows `○`. A `--port` path that does not exist yet is retried with the same backoff, so comrade connects once it appears.
+- A write that cannot go out within 2 s (for example, a full output buffer) is dropped. The tab shows `write timed out, N bytes dropped`, and the port stays open, so reading goes on.
 - On `q`, `Ctrl-C`, SIGTERM, SIGHUP or a panic, comrade restores the terminal. It leaves the alternate screen, turns off raw mode and mouse capture, and shows the cursor.
 - comrade renders only when something changed, and at most 60 times a second. During a flood of data it draws one frame for many batches. When nothing happens, it does not busy-wait.
 
