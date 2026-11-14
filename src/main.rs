@@ -3,6 +3,7 @@
 mod board;
 mod event;
 mod lines;
+mod scrollback;
 mod store;
 
 fn main() {}
