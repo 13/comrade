@@ -39,6 +39,7 @@ You never need a flag. These two exist only to override the defaults.
 | Flag | Effect |
 |---|---|
 | `--baud <rate>` | Sets the baud rate for boards that have no remembered rate. The default is 115200. |
+| `--log-dir <dir>` | Also appends every tab's lines to `<dir>/comrade-<board>-<YYYYMMDD-HHMMSS>.log` as they arrive (full date and time on each line, colour codes removed). The files survive a crash or kill. If the directory cannot be written, logging stops and the status line says why. |
 | `--port <path>` | Opens this port at startup even if it is not a known board, for example `--port /dev/ttyS0` or a pty. You can repeat it. |
 
 ### Screen

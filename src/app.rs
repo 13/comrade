@@ -27,6 +27,7 @@ use crate::core::Core;
 use crate::event::{Command, ConnId, Event, Now};
 use crate::io::opener_watch::OpenerWatch;
 use crate::io::{PortHandle, spawn_port, udev_watch};
+use crate::logfile::LogSink;
 use crate::scrollback::strip_sgr;
 use crate::store::{self, BoardPrefs};
 use crate::ui::{self, UiOutcome, View};
@@ -51,6 +52,9 @@ pub struct Args {
     /// Open this port at startup, even if it is not a known board (repeatable).
     #[arg(long)]
     pub port: Vec<PathBuf>,
+    /// Also append every tab's lines to a file in this directory as they arrive.
+    #[arg(long, value_name = "DIR")]
+    pub log_dir: Option<PathBuf>,
 }
 
 /// A running port worker and what it was opened with.
@@ -77,6 +81,7 @@ pub struct App {
     ports: HashMap<BoardKey, Port>,
     /// Directory `s` saves into (the working directory in the real app).
     save_dir: PathBuf,
+    log: Option<LogSink>,
     dirty: bool,
     quit: bool,
     last_frame: Option<Instant>,
@@ -104,6 +109,7 @@ impl App {
             prefs,
             ports: HashMap::new(),
             save_dir: PathBuf::from("."),
+            log: None,
             dirty: true,
             quit: false,
             last_frame: None,
@@ -138,6 +144,19 @@ impl App {
                 let cmds = self.core.handle(ev, now);
                 self.exec(cmds);
             }
+        }
+        self.sync_log(now);
+    }
+
+    /// Appends new lines to the `--log-dir` files. On the first error the
+    /// logging stops and the status line says why.
+    fn sync_log(&mut self, now: Now) {
+        let Some(log) = &mut self.log else {
+            return;
+        };
+        if let Err(e) = log.sync(self.core.tabs(), now.wall) {
+            self.log = None;
+            self.view.set_status(format!("logging stopped: {e}"));
         }
     }
 
@@ -552,6 +571,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let mut app = App::new(core, opener, tx.clone(), state_path);
+    if let Some(dir) = args.log_dir {
+        match LogSink::new(dir) {
+            Ok(l) => app.log = Some(l),
+            Err(e) => app.view.set_status(format!("cannot log: {e}")),
+        }
+    }
     if let Some(e) = opener_err {
         app.view
             .set_status(format!("upload detection off (inotify: {e})"));

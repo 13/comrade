@@ -118,6 +118,11 @@ impl Scrollback {
         self.new_since_freeze = 0;
     }
 
+    /// Lines pushed since creation, including those dropped or cleared.
+    pub fn total(&self) -> u64 {
+        self.dropped + self.lines.len() as u64
+    }
+
     pub fn len(&self) -> usize {
         self.lines.len()
     }

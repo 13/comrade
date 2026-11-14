@@ -21,7 +21,7 @@ Items are grouped by priority. Each item has a check that tells you when it is d
   Check: you can copy a line from the log into another program without leaving comrade.
 - [x] **Wrong-baud hint.** When a connected port delivers mostly bytes that are not printable or not valid UTF-8, show a status note such as `looks like the wrong baud rate (try b)`. Zero-config tools should say so when the baud is wrong.
   Check: feed a pty with 9600-baud garbage while the tab is set to 115200; the note appears, and it goes away when good text arrives.
-- [ ] **Continuous logging to a file.** `s` saves a snapshot only. Add an optional `--log-dir <dir>` that appends every tab's lines to a file as they arrive, so a long run or a crash does not lose data.
+- [x] **Continuous logging to a file.** `s` saves a snapshot only. Add an optional `--log-dir <dir>` that appends every tab's lines to a file as they arrive, so a long run or a crash does not lose data.
   Check: kill comrade with SIGKILL; the log holds everything up to that moment.
 - [ ] **Filter view.** Show only the lines that match the search (like `grep`), with a key to turn it on and off. Search today only jumps between hits.
   Check: with the filter on, only matching lines show, and new matching lines keep arriving.
