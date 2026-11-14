@@ -27,8 +27,8 @@ Items are grouped by priority. Each item has a check that tells you when it is d
   Check: with the filter on, only matching lines show, and new matching lines keep arriving.
 - [x] **Serial format.** The format is fixed at 8N1 (see `src/ui/mod.rs`). Add data bits, parity and stop bits to the baud picker and remember them per board.
   Check: unit-tested (`format_flags`). A pty forces 8N1, so the real effect still needs a hardware check: set 7E1 on a board that sends it and confirm the text is right.
-- [ ] **More vendors in the allowlist.** Add Nordic `1915`, SEGGER `1366`, NXP `1fc9` and similar, each with the DTR/RTS family that fits. Check that boards with two serial interfaces (FT2232, some probes) get one tab per interface.
-  Check: a unit test per new VID; a dual-port device shows two tabs.
+- [x] **More vendors in the allowlist** (done: PL2303, Nordic, SEGGER, NXP; the dual-interface check is still open, see below). Add Nordic `1915`, SEGGER `1366`, NXP `1fc9` and similar, each with the DTR/RTS family that fits. Check that boards with two serial interfaces (FT2232, some probes) get one tab per interface.
+  Open: plug in a dual-port device (FT2232, some probes) and confirm each interface gets its own tab and survives a replug. The code falls back to a path-based key when two ports share a serial, but nobody has run it on real hardware.
 
 ## P2: polish and distribution
 

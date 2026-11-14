@@ -28,7 +28,7 @@ comrade
 
 That is all you need. comrade lists the USB serial ports that are already present and watches for new ones. It opens each port that belongs to a known microcontroller vendor.
 
-**Auto-connected vendors (by USB VID):** Espressif `303a`, Arduino `2341` and `2a03`, WCH/CH340 `1a86`, Silicon Labs CP210x `10c4`, FTDI `0403`, Raspberry Pi `2e8a`, Adafruit `239a`, SparkFun `1b4f`, STMicro `0483`, PJRC/Teensy `16c0` and Seeed `2886`.
+**Auto-connected vendors (by USB VID):** Espressif `303a`, Arduino `2341` and `2a03`, WCH/CH340 `1a86`, Silicon Labs CP210x `10c4`, FTDI `0403`, Raspberry Pi `2e8a`, Adafruit `239a`, SparkFun `1b4f`, STMicro `0483`, PJRC/Teensy `16c0`, Seeed `2886`, Prolific PL2303 `067b`, Nordic `1915` (its DFU PID `521f` is a bootloader), SEGGER J-Link `1366` and NXP `1fc9`.
 
 comrade never opens any other USB serial device on its own. A phone that shows up as `/dev/ttyACM0` is one example. Such devices are listed under `c` (other ports), and you can connect to them from there. comrade ignores non-USB ttys (`ttyS*`).
 
@@ -132,9 +132,9 @@ When Linux opens a serial port, the kernel raises both DTR and RTS. Right after 
 
 | Family | Examples (VID:PID) | DTR | RTS | Why |
 |---|---|---|---|---|
-| UART bridge | CP210x `10c4`, CH340 `1a86`, FTDI `0403`, Uno/Mega 16U2 `2341:0043/0001/0010/0042/0243` and the same PIDs under `2a03`, ST-Link `0483` | off | off | On ESP32 boards with the two-transistor auto-reset circuit, DTR on with RTS off pulls IO0 low. The reset button would then start download mode. |
+| UART bridge | CP210x `10c4`, CH340 `1a86`, FTDI `0403`, PL2303 `067b`, Uno/Mega 16U2 `2341:0043/0001/0010/0042/0243` and the same PIDs under `2a03`, ST-Link `0483` | off | off | On ESP32 boards with the two-transistor auto-reset circuit, DTR on with RTS off pulls IO0 low. The reset button would then start download mode. |
 | ESP USB-Serial-JTAG | `303a:1001` (built into ESP32-S3, C3 and C6) | off | off | RTS on holds the chip in reset. |
-| Native USB CDC | Leonardo, Micro, Zero and other `2341`/`2a03` CDC PIDs (bit 15 set, e.g. `8036`, `804d`); SparkFun `1b4f`, Adafruit `239a` and Seeed `2886` PIDs with bit 15 set; RP2040 `2e8a`; Teensy `16c0`; other Espressif `303a` PIDs (TinyUSB) | on | off | These USB stacks treat DTR as "host is listening". Without it, `while (!Serial)` sketches and TinyUSB print nothing. |
+| Native USB CDC | Leonardo, Micro, Zero and other `2341`/`2a03` CDC PIDs (bit 15 set, e.g. `8036`, `804d`); SparkFun `1b4f`, Adafruit `239a` and Seeed `2886` PIDs with bit 15 set; RP2040 `2e8a`; Teensy `16c0`; Nordic `1915`, SEGGER `1366` and NXP `1fc9` CDC ports; other Espressif `303a` PIDs (TinyUSB) | on | off | These USB stacks treat DTR as "host is listening". Without it, `while (!Serial)` sketches and TinyUSB print nothing. |
 | Unknown / manual (`--port`, `c`) | anything else | on | off | Same as the pyserial and miniterm default. |
 
 **comrade resets ESP boards when they are plugged in, so the boot log is captured.** When an ESP USB-Serial-JTAG board, or a board behind a UART bridge other than Arduino's own (`2341`, `2a03`), is plugged in while comrade runs, comrade opens the port and then sends one reset pulse (see `r` below), with a `reset` separator. This also happens when such a board comes back after an unplug. It does not happen for boards that are already plugged in when comrade starts, when a board comes back after an upload (the uploader already reset it), or on a reconnect retry.
