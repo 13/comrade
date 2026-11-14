@@ -225,6 +225,8 @@ impl App {
             UiOutcome::None | UiOutcome::Redraw => {}
             UiOutcome::Quit => self.quit = true,
             UiOutcome::Save => self.save(now),
+            UiOutcome::Copy(text) => self.copy(&text),
+            UiOutcome::ToggleMouse => self.toggle_mouse(),
             UiOutcome::Action(a) => {
                 let cmds = self.core.action(a, now);
                 self.exec(cmds);
@@ -346,6 +348,35 @@ impl App {
 
     /// `s`: focused tab's scrollback as plain text into
     /// `comrade-<board>-<YYYYMMDD-HHMMSS>.log`.
+    /// Copy to the clipboard with OSC 52. The terminal decides whether to allow it.
+    fn copy(&mut self, text: &str) {
+        match osc52(text) {
+            Some(seq) => {
+                use std::io::Write as _;
+                let mut out = io::stdout();
+                let _ = out.write_all(seq.as_bytes());
+                let _ = out.flush();
+                self.view.set_status(format!(
+                    "copied {} bytes (needs OSC 52 in your terminal)",
+                    text.len()
+                ));
+            }
+            None => self.view.set_status("line too long to copy"),
+        }
+    }
+
+    fn toggle_mouse(&mut self) {
+        self.view.mouse = !self.view.mouse;
+        if self.view.mouse {
+            let _ = execute!(io::stdout(), EnableMouseCapture);
+            self.view.set_status("mouse on");
+        } else {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+            self.view
+                .set_status("mouse off: select text with the terminal, m turns it on");
+        }
+    }
+
     fn save(&mut self, now: Now) {
         let Some(tab) = self.core.tabs().get(self.core.focus()) else {
             self.view.set_status("nothing to save");
@@ -1042,5 +1073,66 @@ mod tests {
         assert_eq!(sanitize_name("Uno"), "Uno");
         assert_eq!(sanitize_name("a b:c.d_e"), "a_b_c.d_e");
         assert_eq!(sanitize_name("ü"), "_");
+    }
+}
+
+/// Largest text copied through OSC 52. Many terminals refuse more.
+const OSC52_MAX: usize = 75_000;
+
+/// The OSC 52 sequence that puts `text` on the clipboard, or `None` if it is
+/// over the size cap.
+fn osc52(text: &str) -> Option<String> {
+    if text.len() > OSC52_MAX {
+        return None;
+    }
+    Some(format!("\x1b]52;c;{}\x07", base64(text.as_bytes())))
+}
+
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        for (i, o) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(i.as_bytes()), o);
+        }
+    }
+
+    #[test]
+    fn osc52_wraps_and_caps() {
+        assert_eq!(osc52("foo").unwrap(), "\x1b]52;c;Zm9v\x07");
+        assert!(osc52(&"x".repeat(OSC52_MAX + 1)).is_none());
     }
 }

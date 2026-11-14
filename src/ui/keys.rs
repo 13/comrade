@@ -20,6 +20,10 @@ pub enum UiOutcome {
     Action(Action),
     Quit,
     Save,
+    /// Copy this text to the clipboard (OSC 52).
+    Copy(String),
+    /// Turn mouse capture on or off.
+    ToggleMouse,
     Redraw,
 }
 
@@ -218,6 +222,16 @@ fn log_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
             UiOutcome::Redraw
         }
         KeyCode::Char('s') => UiOutcome::Save,
+        KeyCode::Char('m') => UiOutcome::ToggleMouse,
+        KeyCode::Char('y') => {
+            let i = core.focus();
+            core.tabs()
+                .get(i)
+                .and_then(|t| t.scroll.get(t.scroll.position()))
+                .map_or(UiOutcome::None, |l| {
+                    UiOutcome::Copy(crate::scrollback::strip_sgr(&l.text).into_owned())
+                })
+        }
         KeyCode::Char('C') => UiOutcome::Action(Action::ClearTab),
         KeyCode::Char('x') => UiOutcome::Action(Action::CloseTab),
         KeyCode::Char('?') => {

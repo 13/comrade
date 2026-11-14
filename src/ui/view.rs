@@ -30,6 +30,8 @@ pub struct View {
     pub search_origin: Option<(usize, bool)>,
     pub timestamps: bool,
     pub wrap: bool,
+    /// Mouse capture is on (off lets the terminal select text).
+    pub mouse: bool,
     pub picker_idx: usize,
     pub custom_baud: String,
     pub status_msg: Option<(String, Instant)>,
@@ -52,6 +54,7 @@ impl Default for View {
             search_origin: None,
             timestamps: true,
             wrap: true,
+            mouse: true,
             picker_idx: 0,
             custom_baud: String::new(),
             status_msg: None,

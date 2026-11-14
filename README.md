@@ -95,11 +95,15 @@ comrade never clears the scrollback on its own. It keeps the last 100 000 lines 
 | `t` | toggle timestamps |
 | `w` | toggle wrap |
 | `c` | list other (non-allowlisted) ports, connect manually |
+| `y` | copy the bottom visible line (or the search hit) to the clipboard with OSC 52 |
+| `m` | mouse capture on/off; off lets the terminal select text |
 | `s` | save tab scrollback to `./comrade-<board>-<YYYYMMDD-HHMMSS>.log` |
 | `C` (shift) | clear tab scrollback |
 | `x` | close tab |
 | `?` | help overlay |
 | `q` / `Ctrl-C` | quit |
+
+`y` needs a terminal that supports OSC 52 (kitty, WezTerm, foot, Alacritty, iTerm2 and others; tmux needs `set -g set-clipboard on`). Lines over 75 000 bytes are not copied. While mouse capture is on, hold Shift to select text with the terminal, or press `m` to turn capture off.
 
 When you scroll up, the view freezes and shows `+N new`. Press `End` to follow again.
 

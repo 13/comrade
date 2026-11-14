@@ -690,6 +690,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Board",
         &[
+            ("y", "copy the bottom line to the clipboard"),
+            ("m", "mouse on/off (off: select text with the terminal)"),
             ("i Enter", "focus send box"),
             ("I", "raw mode: keys go to the board, Ctrl-] leaves"),
             ("b", "baud picker"),
@@ -933,6 +935,23 @@ mod tests {
             UiOutcome::Redraw
         );
         assert_eq!(v.mode, Mode::Log);
+    }
+
+    #[test]
+    fn y_copies_bottom_line_and_m_toggles_mouse() {
+        let mut c = core_with(1);
+        let mut v = View::new();
+        assert_eq!(on_key(&mut v, &mut c, ch('y')), UiOutcome::None);
+        c.tabs_mut()[0].scroll.push(crate::lines::Line {
+            at: chrono::Local::now(),
+            kind: crate::lines::LineKind::Data,
+            text: "\x1b[31mhello\x1b[0m".into(),
+        });
+        assert_eq!(
+            on_key(&mut v, &mut c, ch('y')),
+            UiOutcome::Copy("hello".into())
+        );
+        assert_eq!(on_key(&mut v, &mut c, ch('m')), UiOutcome::ToggleMouse);
     }
 
     #[test]

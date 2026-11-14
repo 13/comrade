@@ -17,7 +17,7 @@ Items are grouped by priority. Each item has a check that tells you when it is d
 
 - [x] **Raw pass-through mode.** Send every key straight to the port (arrows, Tab, Ctrl-C, history), with one escape key such as `Ctrl-]`. This is what you need for shells and REPLs on the board: the ESP-IDF console, MicroPython, Zephyr shell, bootloader prompts. The send box only sends whole lines today.
   Check: in a MicroPython REPL, Tab completion and Up-arrow history work.
-- [ ] **Text selection and copy.** comrade turns on mouse capture, which blocks the terminal's own selection (only Shift-drag works, and some terminals do not allow it). Add OSC 52 copy (already in the list below) and either a selection mode or a key that turns mouse capture off.
+- [x] **Text selection and copy.** comrade turns on mouse capture, which blocks the terminal's own selection (only Shift-drag works, and some terminals do not allow it). Add OSC 52 copy (already in the list below) and either a selection mode or a key that turns mouse capture off.
   Check: you can copy a line from the log into another program without leaving comrade.
 - [ ] **Wrong-baud hint.** When a connected port delivers mostly bytes that are not printable or not valid UTF-8, show a status note such as `looks like the wrong baud rate (try b)`. Zero-config tools should say so when the baud is wrong.
   Check: feed a pty with 9600-baud garbage while the tab is set to 115200; the note appears, and it goes away when good text arrives.
@@ -32,7 +32,7 @@ Items are grouped by priority. Each item has a check that tells you when it is d
 
 ## P2: polish and distribution
 
-- [ ] Copy to clipboard via OSC 52 (for example the current line or a search hit), with a size cap.
+- [x] Copy to clipboard via OSC 52 (for example the current line or a search hit), with a size cap.
 - [ ] Type-to-search inside the help popup: highlight matches, dim the rest.
 - [ ] "Terminal too small" screen below a minimum size, instead of a cramped layout.
 - [ ] Short-lived status notes with severity (info / error) instead of plain strings. The wrong-baud hint above needs this.
