@@ -122,6 +122,7 @@ fn drop_also_closes() {
 }
 
 #[test]
+#[allow(deprecated)] // raw flock(2) on purpose
 fn not_exclusive() {
     let pty = make_pty();
     let (_h, rx) = start(&pty.path);
@@ -130,7 +131,13 @@ fn not_exclusive() {
         .read(true)
         .write(true)
         .open(&pty.path);
-    assert!(second.is_ok(), "{second:?}");
+    let second = second.expect("second open");
+    // An exclusive flock by another process (esptool, pyserial) must succeed.
+    nix::fcntl::flock(
+        second.as_raw_fd(),
+        nix::fcntl::FlockArg::LockExclusiveNonblock,
+    )
+    .expect("flock LOCK_EX|LOCK_NB");
 }
 
 #[test]
@@ -170,4 +177,79 @@ fn set_baud_and_pulse_on_pty_do_not_kill_worker() {
         Event::PortData { bytes, .. } => assert!(!bytes.is_empty()),
         _ => panic!("expected data"),
     }
+}
+
+fn assert_fd_released_within_50ms(path: &std::path::Path) {
+    let t = Instant::now();
+    while fd_open_to(path) {
+        assert!(t.elapsed() < Duration::from_millis(50), "fd still open");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn open_at_74880_succeeds() {
+    // Custom bauds go through termios2/BOTHER. A pty may reject it; that is
+    // ignored (port stays open at the placeholder rate), so open must succeed.
+    let pty = make_pty();
+    let (tx, rx) = unbounded();
+    let policy = LinePolicy {
+        dtr: false,
+        rts: false,
+    };
+    let _h = spawn_port(key(), 7, pty.path.clone(), 74880, policy, tx);
+    expect_opened(&rx);
+}
+
+#[test]
+fn set_baud_74880_keeps_port_alive() {
+    let pty = make_pty();
+    let (h, rx) = start(&pty.path);
+    expect_opened(&rx);
+    h.set_baud(74880);
+    h.set_baud(12345);
+    nix::unistd::write(&pty.master, b"after").unwrap();
+    match rx.recv_timeout(WAIT).expect("event") {
+        Event::PortData { bytes, .. } => assert!(!bytes.is_empty()),
+        Event::PortGone { reason, .. } => panic!("PortGone: {reason}"),
+        _ => panic!("unexpected event"),
+    }
+}
+
+#[test]
+fn close_is_fast_with_stuck_writes() {
+    let pty = make_pty();
+    let (h, rx) = start(&pty.path);
+    expect_opened(&rx);
+    // master is never read: the pty buffer fills and writes stall
+    for _ in 0..64 {
+        h.write(vec![b'a'; 64 * 1024]);
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    h.close();
+    assert_fd_released_within_50ms(&pty.path);
+}
+
+#[test]
+fn close_right_after_reset_pulse_is_fast() {
+    for fam in [Family::UartBridge, Family::NativeCdc] {
+        let pty = make_pty();
+        let (h, rx) = start(&pty.path);
+        expect_opened(&rx);
+        h.reset_pulse(fam);
+        std::thread::sleep(Duration::from_millis(10));
+        h.close();
+        assert_fd_released_within_50ms(&pty.path);
+    }
+}
+
+#[test]
+fn receiver_dropped_stops_worker() {
+    let pty = make_pty();
+    let (h, rx) = start(&pty.path);
+    expect_opened(&rx);
+    drop(rx);
+    nix::unistd::write(&pty.master, b"data").unwrap();
+    assert_fd_released_within_50ms(&pty.path);
+    drop(h);
 }
