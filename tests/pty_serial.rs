@@ -35,7 +35,15 @@ fn start(path: &std::path::Path) -> (PortHandle, Receiver<Event>) {
         dtr: false,
         rts: false,
     };
-    let h = spawn_port(key(), 7, path.to_path_buf(), 115200, policy, tx);
+    let h = spawn_port(
+        key(),
+        7,
+        path.to_path_buf(),
+        115200,
+        Default::default(),
+        policy,
+        tx,
+    );
     (h, rx)
 }
 
@@ -207,7 +215,15 @@ fn open_at_74880_succeeds() {
         dtr: false,
         rts: false,
     };
-    let _h = spawn_port(key(), 7, pty.path.clone(), 74880, policy, tx);
+    let _h = spawn_port(
+        key(),
+        7,
+        pty.path.clone(),
+        74880,
+        Default::default(),
+        policy,
+        tx,
+    );
     expect_opened(&rx);
 }
 
@@ -298,4 +314,49 @@ fn stuck_write_warns_and_keeps_port_open() {
         }
     }
     drop(h);
+}
+
+#[test]
+fn format_is_applied_at_open_and_by_set_format() {
+    use comrade::store::{Parity, SerialFormat};
+    use nix::sys::termios::{ControlFlags, tcgetattr};
+    let pty = make_pty();
+    let (tx, rx): (Sender<Event>, _) = unbounded();
+    let policy = LinePolicy {
+        dtr: false,
+        rts: false,
+    };
+    let h = spawn_port(
+        key(),
+        7,
+        pty.path.clone(),
+        115200,
+        SerialFormat::new(7, Parity::Even, 1),
+        policy,
+        tx,
+    );
+    expect_opened(&rx);
+    // On a pty, the master reads back the slave's termios.
+    let flags = || tcgetattr(&pty.master).unwrap().control_flags;
+    let f = flags();
+    assert!(f.contains(ControlFlags::CS7) && !f.contains(ControlFlags::CS8));
+    assert!(f.contains(ControlFlags::PARENB) && !f.contains(ControlFlags::PARODD));
+    assert!(!f.contains(ControlFlags::CSTOPB));
+    h.set_format(SerialFormat::new(8, Parity::Odd, 2));
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let f = flags();
+        if f.contains(ControlFlags::CS8)
+            && f.contains(ControlFlags::PARODD)
+            && f.contains(ControlFlags::CSTOPB)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "format not applied: {f:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    h.close();
 }

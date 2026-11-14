@@ -13,7 +13,7 @@ use crate::board::{
 use crate::event::{Command, ConnId, Event, Holder, Now, OpenError};
 use crate::lines::{Line, LineAssembler, LineKind};
 use crate::scrollback::{Scrollback, strip_sgr};
-use crate::store::{BoardPrefs, LineEnding};
+use crate::store::{BoardPrefs, LineEnding, SerialFormat};
 use pause::PauseTracker;
 
 const SCROLLBACK_CAP: usize = 100_000;
@@ -48,6 +48,7 @@ pub struct Tab {
     pub state: TabState,
     pub baud: u32,
     pub line_ending: LineEnding,
+    pub format: SerialFormat,
     pub scroll: Scrollback,
     pub asm: LineAssembler,
     pub conn: ConnId,
@@ -84,6 +85,7 @@ pub enum Action {
     /// Bytes written as they are, with no line ending added.
     SendRaw(Vec<u8>),
     SetBaud(u32),
+    SetFormat(SerialFormat),
     TogglePause,
     Reset,
     ClearTab,
@@ -386,6 +388,19 @@ impl Core {
                     self.persist(&mut cmds);
                 }
             }
+            Action::SetFormat(format) => {
+                if let Some(t) = self.tabs.get_mut(self.focus) {
+                    t.format = format;
+                    t.guard.reset();
+                    if t.state == TabState::Connected {
+                        cmds.push(Command::SetFormat {
+                            key: t.key.clone(),
+                            format,
+                        });
+                    }
+                    self.persist(&mut cmds);
+                }
+            }
             Action::CycleLineEnding => {
                 if let Some(t) = self.tabs.get_mut(self.focus) {
                     t.line_ending = match t.line_ending {
@@ -491,9 +506,9 @@ impl Core {
         if let Some(i) = self.tabs.iter().position(|t| t.key == key) {
             return i;
         }
-        let (baud, line_ending) = match self.prefs.get(&key) {
-            Some(p) => (p.baud, p.line_ending),
-            None => (self.default_baud, LineEnding::Lf),
+        let (baud, line_ending, format) = match self.prefs.get(&key) {
+            Some(p) => (p.baud, p.line_ending, p.format),
+            None => (self.default_baud, LineEnding::Lf, SerialFormat::default()),
         };
         let focused_connected = self
             .tabs
@@ -507,6 +522,7 @@ impl Core {
             state: TabState::Waiting,
             baud,
             line_ending,
+            format,
             scroll: Scrollback::new(SCROLLBACK_CAP),
             asm: LineAssembler::new(),
             conn: 0,
@@ -562,6 +578,7 @@ impl Core {
             conn,
             devnode: path,
             baud: t.baud,
+            format: t.format,
             policy,
         });
     }
@@ -891,6 +908,7 @@ impl Core {
         let prefs = BoardPrefs {
             baud: t.baud,
             line_ending: t.line_ending,
+            format: t.format,
         };
         self.prefs.insert(t.key.clone(), prefs.clone());
         cmds.push(Command::Persist {
@@ -1269,6 +1287,23 @@ mod tests {
     }
 
     #[test]
+    fn set_format_applies_persists_and_is_used_on_open() {
+        let mut c = core();
+        let (key, _) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        let f = SerialFormat::new(7, crate::store::Parity::Even, 2);
+        let cmds = c.action(Action::SetFormat(f), now(2));
+        assert!(matches!(
+            &cmds[0],
+            Command::SetFormat { key: k, format } if *k == key && *format == f
+        ));
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::Persist { prefs, .. } if prefs.format == f))
+        );
+        assert_eq!(c.tabs()[0].format, f);
+    }
+
+    #[test]
     fn send_appends_line_ending() {
         let mut c = core();
         let (key, _) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
@@ -1314,6 +1349,7 @@ mod tests {
             BoardPrefs {
                 baud: 9600,
                 line_ending: LineEnding::CrLf,
+                format: Default::default(),
             },
         );
         let mut c = Core::new(prefs, 115_200, vec![]);

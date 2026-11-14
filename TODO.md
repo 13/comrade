@@ -25,7 +25,7 @@ Items are grouped by priority. Each item has a check that tells you when it is d
   Check: kill comrade with SIGKILL; the log holds everything up to that moment.
 - [x] **Filter view.** Show only the lines that match the search (like `grep`), with a key to turn it on and off. Search today only jumps between hits.
   Check: with the filter on, only matching lines show, and new matching lines keep arriving.
-- [ ] **Serial format.** The format is fixed at 8N1 (see `src/ui/mod.rs`). Add data bits, parity and stop bits to the baud picker and remember them per board.
+- [x] **Serial format.** The format is fixed at 8N1 (see `src/ui/mod.rs`). Add data bits, parity and stop bits to the baud picker and remember them per board.
   Check: a pty pair with 7E1 shows correct text when both sides use 7E1.
 - [ ] **More vendors in the allowlist.** Add Nordic `1915`, SEGGER `1366`, NXP `1fc9` and similar, each with the DTR/RTS family that fits. Check that boards with two serial interfaces (FT2232, some probes) get one tab per interface.
   Check: a unit test per new VID; a dual-port device shows two tabs.

@@ -292,6 +292,7 @@ impl App {
                     conn,
                     devnode,
                     baud,
+                    format,
                     policy,
                 } => {
                     if let Some(old) = self.ports.remove(&key) {
@@ -305,6 +306,7 @@ impl App {
                         conn,
                         devnode.clone(),
                         baud,
+                        format,
                         policy,
                         self.tx.clone(),
                     );
@@ -325,6 +327,11 @@ impl App {
                 Command::SetBaud { key, baud } => {
                     if let Some(p) = self.ports.get(&key) {
                         p.handle.set_baud(baud);
+                    }
+                }
+                Command::SetFormat { key, format } => {
+                    if let Some(p) = self.ports.get(&key) {
+                        p.handle.set_format(format);
                     }
                 }
                 Command::ResetPulse { key, family } => {
@@ -962,6 +969,7 @@ mod tests {
         let prefs = BoardPrefs {
             baud: 9600,
             line_ending: LineEnding::CrLf,
+            format: Default::default(),
         };
         app.exec(vec![Command::Persist {
             key: BoardKey("k".into()),
@@ -1039,6 +1047,7 @@ mod tests {
             conn: 1,
             devnode: Path::new("/dev/x").into(),
             baud: 1,
+            format: Default::default(),
             policy: LinePolicy {
                 dtr: false,
                 rts: false,

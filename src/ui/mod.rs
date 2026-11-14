@@ -143,7 +143,7 @@ fn render_bar(f: &mut Frame, core: &Core, tab: Option<&Tab>, view: &View, r: Rec
                 t.baud.to_string(),
                 Style::new().add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" 8N1 ", theme::muted()),
+            Span::styled(format!(" {} ", t.format), theme::muted()),
         ],
         None => vec![],
     };
@@ -840,8 +840,11 @@ fn overlay_baud(f: &mut Frame, tab: Option<&Tab>, view: &View, area: Rect) {
     picker(
         f,
         area,
-        "Baud rate",
-        &[("Enter", "apply"), ("Esc", "cancel")],
+        &format!(
+            "Baud rate · format {}",
+            tab.map(|t| t.format).unwrap_or_default()
+        ),
+        &[("Enter", "apply"), ("←→", "format"), ("Esc", "cancel")],
         items,
         view.picker_idx,
         36,
@@ -1182,6 +1185,18 @@ mod tests {
             ),
             UiOutcome::Quit
         );
+    }
+
+    #[test]
+    fn baud_picker_left_right_changes_format() {
+        let mut c = core_with(1);
+        let mut v = View::new();
+        on_key(&mut v, &mut c, ch('b'));
+        assert_eq!(
+            on_key(&mut v, &mut c, key(KeyCode::Right)),
+            UiOutcome::Action(Action::SetFormat("8E1".parse().unwrap()))
+        );
+        assert_eq!(v.mode, Mode::BaudPicker);
     }
 
     #[test]

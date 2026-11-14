@@ -91,7 +91,7 @@ comrade never clears the scrollback on its own. It keeps the last 100 000 lines 
 | `f` | filter: show only the lines that match the kept search (`Esc` clears) |
 | `i` or `Enter` | focus send box |
 | `I` (shift) | raw mode: every key goes straight to the board |
-| `b` | baud picker (common rates 300…2 000 000 + custom) |
+| `b` | baud picker (common rates 300…2 000 000 + custom); `←` `→` there change data bits, parity and stop bits (8N1, 8E1, 7E1, …) |
 | `p` | manual pause/resume |
 | `r` | reset board |
 | `t` | toggle timestamps |
@@ -122,7 +122,7 @@ The saved log is plain text, with colour codes removed. Each line has an `HH:MM:
 
 ### What comrade remembers
 
-comrade remembers the baud rate and line ending for each board, keyed by the board's USB identity. It saves them to `$XDG_STATE_HOME/comrade/boards.toml` (by default `~/.local/state/comrade/boards.toml`) whenever you change them.
+comrade remembers the baud rate, the serial format (data bits, parity, stop bits; 8N1 by default) and the line ending for each board, keyed by the board's USB identity. It saves them to `$XDG_STATE_HOME/comrade/boards.toml` (by default `~/.local/state/comrade/boards.toml`) whenever you change them.
 
 If this file is missing or corrupt, comrade ignores it and writes a new one. A problem with the file never stops comrade from running.
 

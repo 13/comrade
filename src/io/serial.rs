@@ -25,6 +25,7 @@ use nix::unistd::{AccessFlags, Gid, Group, access, read, write};
 
 use crate::board::{BoardKey, Family, LinePolicy};
 use crate::event::{ConnId, Event, OpenError};
+use crate::store::{Parity, SerialFormat};
 
 const READ_BUF: usize = 8 * 1024;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -32,6 +33,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 enum PortCmd {
     Write(Vec<u8>),
     SetBaud(u32),
+    SetFormat(SerialFormat),
     ResetPulse(Family),
     Close,
 }
@@ -59,6 +61,10 @@ impl PortHandle {
         self.send(PortCmd::SetBaud(baud));
     }
 
+    pub fn set_format(&self, format: SerialFormat) {
+        self.send(PortCmd::SetFormat(format));
+    }
+
     pub fn reset_pulse(&self, family: Family) {
         self.send(PortCmd::ResetPulse(family));
     }
@@ -80,6 +86,7 @@ pub fn spawn_port(
     conn: ConnId,
     devnode: PathBuf,
     baud: u32,
+    format: SerialFormat,
     policy: LinePolicy,
     tx: Sender<Event>,
 ) -> PortHandle {
@@ -115,6 +122,7 @@ pub fn spawn_port(
                 conn,
                 &devnode,
                 baud,
+                format,
                 policy,
                 &tx,
                 &cmd_rx,
@@ -244,6 +252,33 @@ fn set_baud(fd: &OwnedFd, baud: u32) -> Result<(), String> {
         .map_err(|e| format!("TCSETS2: {e}"))
 }
 
+/// Sets data bits, parity and stop bits. The baud rate is left as it is.
+fn set_format(fd: &OwnedFd, format: SerialFormat) -> Result<(), String> {
+    let mut t = termios::tcgetattr(fd).map_err(|e| format!("tcgetattr: {e}"))?;
+    t.control_flags.remove(
+        ControlFlags::CSIZE | ControlFlags::PARENB | ControlFlags::PARODD | ControlFlags::CSTOPB,
+    );
+    t.control_flags |= match format.data_bits {
+        5 => ControlFlags::CS5,
+        6 => ControlFlags::CS6,
+        7 => ControlFlags::CS7,
+        _ => ControlFlags::CS8,
+    };
+    match format.parity {
+        Parity::None => {}
+        Parity::Even => t.control_flags |= ControlFlags::PARENB,
+        Parity::Odd => t.control_flags |= ControlFlags::PARENB | ControlFlags::PARODD,
+    }
+    if format.stop_bits == 2 {
+        t.control_flags |= ControlFlags::CSTOPB;
+    }
+    // Parity is not checked on input (INPCK off), so a byte with a bad
+    // parity bit still reaches the log instead of being dropped or marked.
+    t.input_flags
+        .remove(InputFlags::INPCK | InputFlags::PARMRK | InputFlags::IGNPAR);
+    termios::tcsetattr(fd, SetArg::TCSANOW, &t).map_err(|e| format!("tcsetattr: {e}"))
+}
+
 fn configure(fd: &OwnedFd) -> Result<(), String> {
     let mut t: Termios = termios::tcgetattr(fd).map_err(|e| format!("tcgetattr: {e}"))?;
     cfmakeraw(&mut t);
@@ -271,7 +306,12 @@ fn open_error(devnode: &Path, e: Errno) -> OpenError {
     }
 }
 
-fn open_port(devnode: &Path, baud: u32, policy: LinePolicy) -> Result<OwnedFd, OpenError> {
+fn open_port(
+    devnode: &Path,
+    baud: u32,
+    format: SerialFormat,
+    policy: LinePolicy,
+) -> Result<OwnedFd, OpenError> {
     access(devnode, AccessFlags::R_OK | AccessFlags::W_OK).map_err(|e| open_error(devnode, e))?;
     let fd = open(
         devnode,
@@ -280,6 +320,7 @@ fn open_port(devnode: &Path, baud: u32, policy: LinePolicy) -> Result<OwnedFd, O
     )
     .map_err(|e| open_error(devnode, e))?;
     configure(&fd).map_err(OpenError::Other)?;
+    set_format(&fd, format).map_err(OpenError::Other)?;
     // A baud the driver rejects must not make the open fail; the port stays
     // at 115200 (the placeholder rate set by `configure`).
     let _ = set_baud(&fd, baud);
@@ -341,12 +382,13 @@ fn run(
     conn: ConnId,
     devnode: &Path,
     baud: u32,
+    format: SerialFormat,
     policy: LinePolicy,
     tx: &Sender<Event>,
     cmds: &Receiver<PortCmd>,
     wake: &EventFd,
 ) {
-    let fd = match open_port(devnode, baud, policy) {
+    let fd = match open_port(devnode, baud, format, policy) {
         Ok(fd) => fd,
         Err(err) => {
             let _ = tx.send(Event::PortOpenFailed {
@@ -399,6 +441,9 @@ fn run(
                 // info variant, so it is intentionally silent.
                 PortCmd::SetBaud(b) => {
                     let _ = set_baud(&fd, b);
+                }
+                PortCmd::SetFormat(f) => {
+                    let _ = set_format(&fd, f);
                 }
                 PortCmd::ResetPulse(family) => {
                     pulse_steps = pulse_plan(family, policy).into();

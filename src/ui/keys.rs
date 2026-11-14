@@ -139,7 +139,7 @@ pub fn on_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
         Mode::Send => send_key(view, key),
         Mode::Raw => UiOutcome::None,
         Mode::Search => search_key(view, core, key),
-        Mode::BaudPicker => baud_key(view, key),
+        Mode::BaudPicker => baud_key(view, core, key),
         Mode::OtherPorts => ports_key(view, core, key),
         Mode::Help => {
             view.mode = Mode::Log;
@@ -426,7 +426,7 @@ fn search_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
     }
 }
 
-fn baud_key(view: &mut View, key: KeyEvent) -> UiOutcome {
+fn baud_key(view: &mut View, core: &Core, key: KeyEvent) -> UiOutcome {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return UiOutcome::None;
     }
@@ -439,6 +439,13 @@ fn baud_key(view: &mut View, key: KeyEvent) -> UiOutcome {
             view.picker_idx = (view.picker_idx + 1).min(BAUDS.len());
             UiOutcome::Redraw
         }
+        // Data bits, parity and stop bits apply at once and stay in the picker.
+        KeyCode::Left | KeyCode::Right => match core.tabs().get(core.focus()) {
+            Some(t) => {
+                UiOutcome::Action(Action::SetFormat(t.format.step(key.code == KeyCode::Right)))
+            }
+            None => UiOutcome::None,
+        },
         KeyCode::Char(c) if c.is_ascii_digit() => {
             view.picker_idx = BAUDS.len();
             if view.custom_baud.len() < 9 {
