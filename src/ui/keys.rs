@@ -27,6 +27,18 @@ pub enum UiOutcome {
     Redraw,
 }
 
+/// Scroll the filtered view by whole matches. `up` goes toward older matches.
+fn filter_scroll(view: &mut View, core: &Core, up: bool, n: usize) {
+    let last = core.tabs().get(core.focus()).map_or(0, |t| {
+        t.scroll.count_matches(&view.search).saturating_sub(1)
+    });
+    view.filter_skip = if up {
+        (view.filter_skip + n).min(last)
+    } else {
+        view.filter_skip.saturating_sub(n)
+    };
+}
+
 fn scroll_focused(core: &mut Core, f: impl FnOnce(&mut crate::scrollback::Scrollback)) {
     let i = core.focus();
     if let Some(t) = core.tabs_mut().get_mut(i) {
@@ -112,6 +124,8 @@ pub fn on_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
     if key.code == KeyCode::Esc {
         if view.mode == Mode::Log {
             view.search.clear();
+            view.filter = false;
+            view.filter_skip = 0;
         }
         if view.mode == Mode::Search && view.search.is_empty() {
             search_incremental(view, core);
@@ -144,27 +158,51 @@ fn log_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
         KeyCode::Tab => UiOutcome::Action(Action::NextTab),
         KeyCode::BackTab => UiOutcome::Action(Action::PrevTab),
         KeyCode::Up => {
-            scroll_focused(core, |s| s.scroll_up(1));
+            if view.filtering() {
+                filter_scroll(view, core, true, 1)
+            } else {
+                scroll_focused(core, |s| s.scroll_up(1))
+            }
             UiOutcome::Redraw
         }
         KeyCode::Down => {
-            scroll_focused(core, |s| s.scroll_down(1));
+            if view.filtering() {
+                filter_scroll(view, core, false, 1)
+            } else {
+                scroll_focused(core, |s| s.scroll_down(1))
+            }
             UiOutcome::Redraw
         }
         KeyCode::PageUp => {
-            scroll_focused(core, |s| s.scroll_up(page));
+            if view.filtering() {
+                filter_scroll(view, core, true, page)
+            } else {
+                scroll_focused(core, |s| s.scroll_up(page))
+            }
             UiOutcome::Redraw
         }
         KeyCode::PageDown => {
-            scroll_focused(core, |s| s.scroll_down(page));
+            if view.filtering() {
+                filter_scroll(view, core, false, page)
+            } else {
+                scroll_focused(core, |s| s.scroll_down(page))
+            }
             UiOutcome::Redraw
         }
         KeyCode::Home => {
-            scroll_focused(core, |s| s.home());
+            if view.filtering() {
+                filter_scroll(view, core, true, usize::MAX / 2)
+            } else {
+                scroll_focused(core, |s| s.home())
+            }
             UiOutcome::Redraw
         }
         KeyCode::End => {
-            scroll_focused(core, |s| s.end());
+            if view.filtering() {
+                view.filter_skip = 0
+            } else {
+                scroll_focused(core, |s| s.end())
+            }
             UiOutcome::Redraw
         }
         KeyCode::Enter | KeyCode::Char('i') => {
@@ -222,6 +260,16 @@ fn log_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
             UiOutcome::Redraw
         }
         KeyCode::Char('s') => UiOutcome::Save,
+        KeyCode::Char('f') => {
+            if view.search.is_empty() {
+                view.filter = false;
+                view.set_status("filter: search first with /, then press f");
+            } else {
+                view.filter = !view.filter;
+                view.filter_skip = 0;
+            }
+            UiOutcome::Redraw
+        }
         KeyCode::Char('m') => UiOutcome::ToggleMouse,
         KeyCode::Char('y') => {
             let i = core.focus();
@@ -356,11 +404,13 @@ fn search_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
     match key.code {
         KeyCode::Char(c) => {
             view.search.push(c);
+            view.filter_skip = 0;
             search_incremental(view, core);
             UiOutcome::Redraw
         }
         KeyCode::Backspace => {
             view.search.pop();
+            view.filter_skip = 0;
             search_incremental(view, core);
             UiOutcome::Redraw
         }
@@ -445,11 +495,19 @@ pub fn on_mouse(view: &mut View, core: &mut Core, ev: MouseEvent) -> UiOutcome {
     }
     match ev.kind {
         MouseEventKind::ScrollUp => {
-            scroll_focused(core, |s| s.scroll_up(3));
+            if view.filtering() {
+                filter_scroll(view, core, true, 3);
+            } else {
+                scroll_focused(core, |s| s.scroll_up(3));
+            }
             UiOutcome::Redraw
         }
         MouseEventKind::ScrollDown => {
-            scroll_focused(core, |s| s.scroll_down(3));
+            if view.filtering() {
+                filter_scroll(view, core, false, 3);
+            } else {
+                scroll_focused(core, |s| s.scroll_down(3));
+            }
             UiOutcome::Redraw
         }
         MouseEventKind::Down(MouseButton::Left) if ev.row == 0 => view

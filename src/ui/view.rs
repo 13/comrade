@@ -26,6 +26,10 @@ pub struct View {
     pub history: Vec<String>,
     pub hist_idx: Option<usize>,
     pub search: String,
+    /// Show only the lines that match `search`.
+    pub filter: bool,
+    /// Newest matches left out of the filtered view (scrolled back).
+    pub filter_skip: usize,
     /// Where `/` was pressed: (buffer position, was following).
     pub search_origin: Option<(usize, bool)>,
     pub timestamps: bool,
@@ -51,6 +55,8 @@ impl Default for View {
             history: Vec::new(),
             hist_idx: None,
             search: String::new(),
+            filter: false,
+            filter_skip: 0,
             search_origin: None,
             timestamps: true,
             wrap: true,
@@ -66,6 +72,10 @@ impl Default for View {
 }
 
 impl View {
+    /// The filtered view is on and has something to filter by.
+    pub fn filtering(&self) -> bool {
+        self.filter && !self.search.is_empty()
+    }
     pub fn new() -> Self {
         Self::default()
     }

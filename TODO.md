@@ -23,7 +23,7 @@ Items are grouped by priority. Each item has a check that tells you when it is d
   Check: feed a pty with 9600-baud garbage while the tab is set to 115200; the note appears, and it goes away when good text arrives.
 - [x] **Continuous logging to a file.** `s` saves a snapshot only. Add an optional `--log-dir <dir>` that appends every tab's lines to a file as they arrive, so a long run or a crash does not lose data.
   Check: kill comrade with SIGKILL; the log holds everything up to that moment.
-- [ ] **Filter view.** Show only the lines that match the search (like `grep`), with a key to turn it on and off. Search today only jumps between hits.
+- [x] **Filter view.** Show only the lines that match the search (like `grep`), with a key to turn it on and off. Search today only jumps between hits.
   Check: with the filter on, only matching lines show, and new matching lines keep arriving.
 - [ ] **Serial format.** The format is fixed at 8N1 (see `src/ui/mod.rs`). Add data bits, parity and stop bits to the baud picker and remember them per board.
   Check: a pty pair with 7E1 shows correct text when both sides use 7E1.

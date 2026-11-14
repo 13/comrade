@@ -88,6 +88,7 @@ comrade never clears the scrollback on its own. It keeps the last 100 000 lines 
 | `1`–`9`, `Tab`/`Shift-Tab`, click | switch tab |
 | `↑↓ PgUp PgDn Home End`, wheel | scroll / follow |
 | `/` `n` `N` | search |
+| `f` | filter: show only the lines that match the kept search (`Esc` clears) |
 | `i` or `Enter` | focus send box |
 | `I` (shift) | raw mode: every key goes straight to the board |
 | `b` | baud picker (common rates 300…2 000 000 + custom) |

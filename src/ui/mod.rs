@@ -366,9 +366,20 @@ fn render_log(f: &mut Frame, tab: Option<&Tab>, view: &View, r: Rect) {
     let ts = view.timestamps && body.width > TS_WIDTH;
     let ts_w = if ts { TS_WIDTH } else { 0 };
     let body_w = body.width.saturating_sub(ts_w).max(1);
-    let rows = tab
-        .scroll
-        .visible(body.height, body.width, view.wrap, tab.asm.partial(), ts_w);
+    let filtering = view.filtering();
+    let rows = if filtering {
+        tab.scroll.visible_filtered(
+            &view.search,
+            view.filter_skip,
+            body.height,
+            body.width,
+            view.wrap,
+            ts_w,
+        )
+    } else {
+        tab.scroll
+            .visible(body.height, body.width, view.wrap, tab.asm.partial(), ts_w)
+    };
     let lines: Vec<TLine> = rows
         .iter()
         .map(|row| {
@@ -385,6 +396,24 @@ fn render_log(f: &mut Frame, tab: Option<&Tab>, view: &View, r: Rect) {
         .collect();
     f.render_widget(Paragraph::new(lines), body);
 
+    if filtering && r.height > 0 {
+        let msg = if view.filter_skip > 0 {
+            format!(" filter \"{}\" · older · End newest ", view.search)
+        } else {
+            format!(" filter \"{}\" · f off ", view.search)
+        };
+        let w = (msg.width() as u16).min(body.width);
+        f.render_widget(
+            Paragraph::new(msg).style(theme::pill()),
+            Rect {
+                x: body.right() - w,
+                y: r.bottom() - 1,
+                width: w,
+                height: 1,
+            },
+        );
+        return;
+    }
     if tab.scroll.follow() || r.height == 0 {
         return;
     }
@@ -549,6 +578,7 @@ fn hints(view: &View, tab: Option<&Tab>) -> Vec<(&'static str, &'static str)> {
             }
             if !view.search.is_empty() {
                 h.push(("n/N", "next/prev"));
+                h.push(("f", if view.filter { "unfilter" } else { "filter" }));
             }
             h.extend([
                 ("?", "help"),
@@ -692,6 +722,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("y", "copy the bottom line to the clipboard"),
             ("m", "mouse on/off (off: select text with the terminal)"),
+            ("f", "filter: show only lines that match the search"),
             ("i Enter", "focus send box"),
             ("I", "raw mode: keys go to the board, Ctrl-] leaves"),
             ("b", "baud picker"),
@@ -952,6 +983,36 @@ mod tests {
             UiOutcome::Copy("hello".into())
         );
         assert_eq!(on_key(&mut v, &mut c, ch('m')), UiOutcome::ToggleMouse);
+    }
+
+    #[test]
+    fn f_filters_to_search_matches() {
+        let mut c = core_with(1);
+        let mut v = View::new();
+        for t in ["alpha", "beta", "alpha two", "gamma"] {
+            c.tabs_mut()[0].scroll.push(crate::lines::Line {
+                at: chrono::Local::now(),
+                kind: crate::lines::LineKind::Data,
+                text: t.into(),
+            });
+        }
+        // No search yet: f does nothing but explain.
+        on_key(&mut v, &mut c, ch('f'));
+        assert!(!v.filter);
+        for k in "/alpha".chars() {
+            on_key(&mut v, &mut c, ch(k));
+        }
+        on_key(&mut v, &mut c, key(KeyCode::Enter));
+        on_key(&mut v, &mut c, ch('f'));
+        assert!(v.filter);
+        let rows = draw(&c, &v, 60, 10);
+        let body = rows.join("\n");
+        assert!(body.contains("alpha two"), "{body}");
+        assert!(!body.contains("beta") && !body.contains("gamma"), "{body}");
+        assert!(body.contains("filter \"alpha\""));
+        on_key(&mut v, &mut c, key(KeyCode::Esc));
+        assert!(!v.filter && v.search.is_empty());
+        assert!(draw(&c, &v, 60, 10).join("\n").contains("gamma"));
     }
 
     #[test]
