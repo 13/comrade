@@ -387,8 +387,10 @@ fn overlay_help(f: &mut Frame, area: Rect) {
         "q Ctrl-C       quit",
         "",
         "Send box: Enter send, Ctrl-E line ending, Up/Down history, Esc back",
+        "",
+        "If ports are grabbed by ModemManager/brltty, disable them for these devices.",
     ];
-    let r = centered(area, 70, HELP.len() as u16 + 2);
+    let r = centered(area, 80, HELP.len() as u16 + 2);
     f.render_widget(Clear, r);
     let items: Vec<TLine> = HELP.iter().map(|s| TLine::raw(format!(" {s}"))).collect();
     f.render_widget(
@@ -836,6 +838,16 @@ mod tests {
         v.custom_baud = "123".into();
         on_key(&mut v, &mut c, key(KeyCode::Backspace));
         assert_eq!(v.custom_baud, "123");
+    }
+
+    #[test]
+    fn help_mentions_modemmanager_and_brltty() {
+        let c = core_with(1);
+        let mut v = View::new();
+        v.mode = Mode::Help;
+        let rows = draw(&c, &v, 100, 30);
+        let want = "If ports are grabbed by ModemManager/brltty, disable them for these devices.";
+        assert!(rows.iter().any(|r| r.contains(want)), "{rows:#?}");
     }
 
     #[test]

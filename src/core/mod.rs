@@ -309,6 +309,8 @@ impl Core {
                 if let Some(i) = self.matching(&key, conn) {
                     self.port_data(i, &bytes, now);
                 }
+                // Data never changes the watch set: skip `finish`.
+                return cmds;
             }
             Event::PortGone { key, conn, reason } => {
                 if let Some(i) = self.matching(&key, conn) {
@@ -2437,6 +2439,27 @@ mod tests {
                 .any(|c| matches!(c, Command::AcceptHolders { .. }))
         );
         assert_eq!(opens(&cmds).len(), 1);
+    }
+
+    #[test]
+    fn upload_on_one_board_leaves_the_other_streaming() {
+        let mut c = core();
+        let (ka, _) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        let (kb, cb) = connect(&mut c, dev(0x1a86, 0x7523, "B", "/dev/ttyUSB1"));
+        let cmds = foreign_open(&mut c, "/dev/ttyUSB0", esptool(), 10);
+        assert!(cmds.contains(&Command::Close { key: ka.clone() }));
+        assert!(!cmds.contains(&Command::Close { key: kb.clone() }));
+        assert_eq!(c.tabs()[1].state, TabState::Connected);
+        data(&mut c, &kb, cb, b"b still here\r\n");
+        let t = &c.tabs()[1];
+        assert_eq!(
+            t.scroll.get(t.scroll.len() - 1).unwrap().text,
+            "b still here"
+        );
+        let o = opens(&foreign_released(&mut c, "/dev/ttyUSB0", 20));
+        assert_eq!(o, vec![(o[0].0, PathBuf::from("/dev/ttyUSB0"))]);
+        assert_eq!(c.tabs()[0].state, TabState::Connecting);
+        assert_eq!(c.tabs()[1].state, TabState::Connected);
     }
 
     #[test]

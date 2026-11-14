@@ -216,6 +216,7 @@ Boards:
 - [ ] ESP32-S3 on native USB (`303a:1001`)
 - [ ] Arduino Uno
 - [ ] Leonardo or Pro Micro
+- [ ] RP2040 (Pico), including `pio run -t upload` through the 1200-baud touch and UF2 drive
 
 For each board, check that the boot log is visible in each of these cases, with no keypress:
 
@@ -227,5 +228,12 @@ For each board, check that the boot log is visible in each of these cases, with 
 Also check:
 
 - [ ] `r` resets the board and shows the boot log.
+- [ ] `r` on an Uno (and on a CH340 Nano) resets the AVR and shows the boot output.
+- [ ] `r` on a native USB board (Leonardo, RP2040) shows `reset not supported on native USB boards`.
+- [ ] Plugging in an ESP32 while comrade runs shows a `reset` separator and the full boot log.
+- [ ] Two boards at once, one uploading: the other tab keeps streaming, and the uploading one comes back after the upload.
+- [ ] Permission error: with the port's group removed from your user (or `chmod o-rw` on the node), the tab shows `! no permission for … — add yourself to group '…' and re-login`.
+- [ ] `--port /dev/ttyUSB0` (or a `c` port): unplug and replug the board; the same tab reconnects.
+- [ ] A second monitor holding the port: the tab shows `⏸`; `p` resumes it, and a later upload still pauses it.
 - [ ] A phone or other non-allowlisted device is never opened on its own, and it appears under `c`.
 - [ ] Measure how many boot bytes a UART-bridge ESP32 loses after an upload.
