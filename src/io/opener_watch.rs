@@ -372,39 +372,103 @@ fn on_open(shared: &Mutex<Shared>, canon: &Path) {
     }
 }
 
+/// What an IN_CLOSE leads to, given the current state, the recorded
+/// holders that still hold the node, and whether the close was comrade's own.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CloseAction {
+    /// Nothing changes. `relabel` names a remaining holder to report from
+    /// now on (silently) when the reported one left.
+    Keep { relabel: Option<Holder> },
+    /// Emit `ForeignReleased` now. With `verify`, run a full /proc scan
+    /// afterwards and re-emit `ForeignOpen` if a holder we never recorded
+    /// turns up (its open merged with another one).
+    Release { verify: bool },
+}
+
+/// Pure close decision (brief's release rule plus the fast-path ruling).
+pub fn close_action(state: Option<&Holder>, remaining: &[Holder], own: bool) -> CloseAction {
+    match (state, remaining.first()) {
+        (None, _) => CloseAction::Keep { relabel: None },
+        (Some(Holder::Unknown), None) if own => CloseAction::Keep { relabel: None },
+        (Some(Holder::Unknown), None) => CloseAction::Release { verify: false },
+        (Some(Holder::Named { .. }), None) => CloseAction::Release { verify: true },
+        (Some(Holder::Unknown), Some(_)) => CloseAction::Keep { relabel: None },
+        (Some(current), Some(first)) => CloseAction::Keep {
+            relabel: (!remaining.contains(current)).then(|| first.clone()),
+        },
+    }
+}
+
 fn on_close(shared: &Mutex<Shared>, canon: &Path) {
-    let (own, recorded, named_state) = {
+    let (own, recorded) = {
         let mut s = lock(shared);
         let Some(node) = s.nodes.get_mut(canon) else {
             return;
         };
         let own = take_pending(&mut node.own.closes, Instant::now());
-        let named_state = matches!(node.state, Some(Holder::Named { .. }));
-        (own, node.holders.clone(), named_state)
+        (own, node.holders.clone())
     };
     // Fast path: only the pids we know about. A gone pid counts as released.
-    let mut named: Vec<Holder> = recorded
+    let remaining: Vec<Holder> = recorded
         .into_iter()
         .filter(|h| still_holds(h, canon))
         .collect();
-    if named.is_empty() && named_state {
-        // Catch a holder we never recorded (e.g. its open merged with another).
-        named = scan_one(canon);
+    let verify = {
+        let mut s = lock(shared);
+        let Some(node) = s.nodes.get_mut(canon) else {
+            return;
+        };
+        let action = close_action(node.state.as_ref(), &remaining, own);
+        node.holders = remaining;
+        match action {
+            CloseAction::Keep { relabel } => {
+                if let Some(h) = relabel {
+                    node.state = Some(h);
+                }
+                false
+            }
+            CloseAction::Release { verify } => {
+                node.state = None;
+                let devnode = node.original.clone();
+                s.send(Event::ForeignReleased { devnode });
+                verify
+            }
+        }
+    };
+    if verify {
+        verify_release(shared, canon);
+    }
+}
+
+/// After a fast-path release: one full scan for a holder that was never
+/// recorded. Comrade may reopen in this window; uploaders retry their sync.
+fn verify_release(shared: &Mutex<Shared>, canon: &Path) {
+    let found = scan_one(canon);
+    if found.is_empty() {
+        return;
     }
     let mut s = lock(shared);
     let Some(node) = s.nodes.get_mut(canon) else {
         return;
     };
-    node.holders.clone_from(&named);
-    if node.state.is_some() && named.is_empty() && (!own || node.state != Some(Holder::Unknown)) {
-        node.state = None;
-        let devnode = node.original.clone();
-        s.send(Event::ForeignReleased { devnode });
-    } else if let (Some(Holder::Named { .. }), Some(first)) = (&node.state, named.first()) {
-        // The reported holder left but another remains: keep the label
-        // accurate without telling Core again.
-        node.state = Some(first.clone());
+    if node.state.is_some() {
+        return;
     }
+    // Same re-check as set_watched: drop holders that closed after the scan.
+    let holders: Vec<Holder> = found
+        .into_iter()
+        .filter(|h| still_holds(h, canon))
+        .collect();
+    let Some(first) = holders.first().cloned() else {
+        return;
+    };
+    node.holders = holders;
+    node.state = Some(first.clone());
+    let devnode = node.original.clone();
+    s.send(Event::ForeignOpen {
+        devnode,
+        holder: first,
+    });
 }
 
 /// Events were lost (queue overflow): reconcile every node with one /proc
@@ -563,6 +627,62 @@ mod tests {
         assert!(take_pending(&mut q, t0 + OWN_TTL));
     }
 
+    fn named(pid: u32, comm: &str) -> Holder {
+        Holder::Named {
+            pid,
+            comm: comm.into(),
+        }
+    }
+
+    #[test]
+    fn close_on_free_node_keeps() {
+        let keep = CloseAction::Keep { relabel: None };
+        assert_eq!(close_action(None, &[], false), keep);
+        assert_eq!(close_action(None, &[named(1, "a")], true), keep);
+    }
+
+    #[test]
+    fn close_of_last_named_holder_releases_then_verifies() {
+        let esptool = named(10, "esptool");
+        for own in [false, true] {
+            assert_eq!(
+                close_action(Some(&esptool), &[], own),
+                CloseAction::Release { verify: true }
+            );
+        }
+    }
+
+    #[test]
+    fn close_with_unknown_holder() {
+        let u = Holder::Unknown;
+        // foreign close, nothing visible: release, nothing to verify
+        assert_eq!(
+            close_action(Some(&u), &[], false),
+            CloseAction::Release { verify: false }
+        );
+        // our own close says nothing about the invisible holder
+        assert_eq!(
+            close_action(Some(&u), &[], true),
+            CloseAction::Keep { relabel: None }
+        );
+    }
+
+    #[test]
+    fn close_with_remaining_holders_keeps_and_relabels() {
+        let a = named(10, "esptool");
+        let b = named(20, "avrdude");
+        // reported holder still there: label unchanged
+        assert_eq!(
+            close_action(Some(&a), &[b.clone(), a.clone()], false),
+            CloseAction::Keep { relabel: None }
+        );
+        // reported holder left, another remains: silent relabel
+        assert_eq!(
+            close_action(Some(&a), std::slice::from_ref(&b), false),
+            CloseAction::Keep { relabel: Some(b) }
+        );
+    }
+
     fn proc_entry(root: &Path, pid: &str, comm: Option<&str>, links: &[&Path]) {
         let fd = root.join(pid).join("fd");
         std::fs::create_dir_all(&fd).unwrap();
@@ -592,10 +712,6 @@ mod tests {
 
         let targets = HashSet::from([acm0.to_path_buf(), usb0.to_path_buf()]);
         let mut found = holders_in(root, &targets, 400);
-        let named = |pid, comm: &str| Holder::Named {
-            pid,
-            comm: comm.into(),
-        };
         let mut acm = found.remove(acm0).unwrap();
         acm.sort_by_key(|h| match h {
             Holder::Named { pid, .. } => *pid,
