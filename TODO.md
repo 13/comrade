@@ -34,7 +34,7 @@ Items are grouped by priority. Each item has a check that tells you when it is d
 
 - [x] Copy to clipboard via OSC 52 (for example the current line or a search hit), with a size cap.
 - [ ] Type-to-search inside the help popup: highlight matches, dim the rest.
-- [ ] "Terminal too small" screen below a minimum size, instead of a cramped layout.
+- [x] "Terminal too small" screen below a minimum size, instead of a cramped layout.
 - [ ] Short-lived status notes with severity (info / error) instead of plain strings. The wrong-baud hint above needs this.
 - [ ] Optional remappable keymap from a config file, plus a test that keeps the README key table in sync with the defaults. The config file must stay optional: the README promises "no config file needed".
 - [ ] Optional config for extra allowlist VID:PID pairs, with the same rule.

@@ -57,11 +57,30 @@ fn spans_width(spans: &[Span]) -> usize {
     spans.iter().map(|s| s.content.width()).sum()
 }
 
+/// Below this size the layout is cramped, so comrade shows a note instead.
+const MIN_W: u16 = 40;
+const MIN_H: u16 = 8;
+
 pub fn render(f: &mut Frame, core: &Core, view: &View) {
     let area = f.area();
     view.tab_hits.borrow_mut().clear();
     if area.width == 0 || area.height == 0 {
         view.last_log_rows.set(0);
+        return;
+    }
+    if area.width < MIN_W || area.height < MIN_H {
+        view.last_log_rows.set(0);
+        let msg = format!(
+            "terminal too small\n{}x{}, need at least {MIN_W}x{MIN_H}",
+            area.width, area.height
+        );
+        f.render_widget(
+            Paragraph::new(msg)
+                .style(theme::warn())
+                .alignment(Alignment::Center)
+                .wrap(ratatui::widgets::Wrap { trim: true }),
+            area,
+        );
         return;
     }
     let [bar, rule, log, rule2, send, status] = Layout::vertical([
@@ -1019,6 +1038,17 @@ mod tests {
     }
 
     #[test]
+    fn tiny_terminal_shows_a_note() {
+        let c = core_with(1);
+        let v = View::new();
+        let rows = draw(&c, &v, 30, 6).join("\n");
+        assert!(rows.contains("terminal too small"), "{rows}");
+        assert!(rows.contains("30x6"));
+        let rows = draw(&c, &v, 40, 8).join("\n");
+        assert!(!rows.contains("too small"));
+    }
+
+    #[test]
     fn raw_mode_row_and_badge() {
         let c = core_with(1);
         let mut v = View::new();
@@ -1417,7 +1447,14 @@ mod tests {
             .push(line("\x1b[31mabcdefghij\x1b[0m", LineKind::Data));
         let mut v = View::new();
         v.timestamps = false;
-        let rows = draw(&c, &v, 5, 12);
+        // The log area alone: a whole screen this narrow shows the "too small" note.
+        let mut t = Terminal::new(TestBackend::new(5, 12)).unwrap();
+        t.draw(|f| render_log(f, c.tabs().first(), &v, f.area()))
+            .unwrap();
+        let buf = t.backend().buffer().clone();
+        let rows: Vec<String> = (0..12)
+            .map(|y| (0..5).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
         assert!(rows.iter().any(|r| r.starts_with("abcde")));
         assert!(rows.iter().any(|r| r.starts_with("fghij")));
     }
@@ -1431,7 +1468,8 @@ mod tests {
         let mut v = View::new();
         v.timestamps = false;
         let mut t = Terminal::new(TestBackend::new(5, 12)).unwrap();
-        t.draw(|f| render(f, &c, &v)).unwrap();
+        t.draw(|f| render_log(f, c.tabs().first(), &v, f.area()))
+            .unwrap();
         let buf = t.backend().buffer();
         let red = (0..12).filter(|&y| buf[(0, y)].symbol() == "f").count();
         assert_eq!(red, 1);
