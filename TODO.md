@@ -19,7 +19,7 @@ Items are grouped by priority. Each item has a check that tells you when it is d
   Check: in a MicroPython REPL, Tab completion and Up-arrow history work.
 - [x] **Text selection and copy.** comrade turns on mouse capture, which blocks the terminal's own selection (only Shift-drag works, and some terminals do not allow it). Add OSC 52 copy (already in the list below) and either a selection mode or a key that turns mouse capture off.
   Check: you can copy a line from the log into another program without leaving comrade.
-- [ ] **Wrong-baud hint.** When a connected port delivers mostly bytes that are not printable or not valid UTF-8, show a status note such as `looks like the wrong baud rate (try b)`. Zero-config tools should say so when the baud is wrong.
+- [x] **Wrong-baud hint.** When a connected port delivers mostly bytes that are not printable or not valid UTF-8, show a status note such as `looks like the wrong baud rate (try b)`. Zero-config tools should say so when the baud is wrong.
   Check: feed a pty with 9600-baud garbage while the tab is set to 115200; the note appears, and it goes away when good text arrives.
 - [ ] **Continuous logging to a file.** `s` saves a snapshot only. Add an optional `--log-dir <dir>` that appends every tab's lines to a file as they arrive, so a long run or a crash does not lose data.
   Check: kill comrade with SIGKILL; the log holds everything up to that moment.

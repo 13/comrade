@@ -53,6 +53,7 @@ pub struct Tab {
     pub conn: ConnId,
     pub highlight: bool,
     pub rx_bytes: u64,
+    guard: crate::baud_hint::BaudGuard,
     ever_connected: bool,
     data_this_conn: bool,
     /// Completed non-banner lines still to see before a banner counts as a new reset.
@@ -375,6 +376,7 @@ impl Core {
             Action::SetBaud(baud) => {
                 if let Some(t) = self.tabs.get_mut(self.focus) {
                     t.baud = baud;
+                    t.guard.reset();
                     if t.state == TabState::Connected {
                         cmds.push(Command::SetBaud {
                             key: t.key.clone(),
@@ -414,6 +416,7 @@ impl Core {
                         });
                         t.scroll.push(separator(now, "reset"));
                         t.data_this_conn = false;
+                        t.guard.reset();
                     } else {
                         t.scroll
                             .push(line(now, LineKind::Info, "not connected".into()));
@@ -509,6 +512,7 @@ impl Core {
             conn: 0,
             highlight: false,
             rx_bytes: 0,
+            guard: Default::default(),
             ever_connected: false,
             data_this_conn: false,
             banner_quiet: 0,
@@ -541,6 +545,7 @@ impl Core {
         t.conn = conn;
         t.state = TabState::Connecting;
         t.data_this_conn = false;
+        t.guard.reset();
         t.retry_at = None;
         t.await_unblock = false;
         // `--port` / `c` paths are not udev-tracked: the node may have been
@@ -805,6 +810,16 @@ impl Core {
             return;
         }
         t.rx_bytes += bytes.len() as u64;
+        if t.guard.push(bytes) {
+            t.scroll.push(line(
+                now,
+                LineKind::Info,
+                format!(
+                    "output does not look like text: wrong baud rate? now {}, press b to change",
+                    t.baud
+                ),
+            ));
+        }
         let pushed = t.asm.push(bytes, now.wall);
         let had_data = t.data_this_conn;
         for l in pushed.complete {
@@ -1185,6 +1200,26 @@ mod tests {
         let l = t.scroll.get(0).unwrap();
         assert_eq!(l.text, msg);
         assert_eq!(l.kind, LineKind::Error);
+    }
+
+    #[test]
+    fn garbage_output_shows_wrong_baud_note_once() {
+        let mut c = core();
+        let (key, conn) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        let mut x: u32 = 7;
+        let noise: Vec<u8> = (0..1024)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x >> 24) as u8
+            })
+            .collect();
+        data(&mut c, &key, conn, &noise);
+        data(&mut c, &key, conn, &noise);
+        let notes = texts(&c.tabs()[0])
+            .iter()
+            .filter(|l| l.contains("wrong baud rate"))
+            .count();
+        assert_eq!(notes, 1);
     }
 
     #[test]

@@ -217,6 +217,7 @@ comrade never needs root.
 - A missing node (`ENOENT`, `ENODEV`, `ENXIO`) is not an error: the tab shows `○`. A `--port` path that does not exist yet is retried with the same backoff, so comrade connects once it appears.
 - A write that cannot go out within 2 s (for example, a full output buffer) is dropped. The tab shows `write timed out, N bytes dropped`, and the port stays open, so reading goes on.
 - On `q`, `Ctrl-C`, SIGTERM, SIGHUP or a panic, comrade restores the terminal. It leaves the alternate screen, turns off raw mode and mouse capture, and shows the cursor.
+- If a connection delivers 512 bytes of output that is not text (many control bytes or invalid UTF-8), comrade adds one note to the tab: `output does not look like text: wrong baud rate? now 115200, press b to change`. It shows once per connection and baud rate.
 - comrade renders only when something changed, and at most 60 times a second. During a flood of data it draws one frame for many batches. When nothing happens, it does not busy-wait.
 
 ## Hardware checklist
