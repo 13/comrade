@@ -1,9 +1,11 @@
 pub mod app;
+pub mod baud_hint;
 pub mod board;
 pub mod core;
 pub mod event;
 pub mod io;
 pub mod lines;
+pub mod logfile;
 pub mod scrollback;
 pub mod store;
 pub mod ui;

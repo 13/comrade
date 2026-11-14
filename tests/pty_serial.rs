@@ -35,7 +35,15 @@ fn start(path: &std::path::Path) -> (PortHandle, Receiver<Event>) {
         dtr: false,
         rts: false,
     };
-    let h = spawn_port(key(), 7, path.to_path_buf(), 115200, policy, tx);
+    let h = spawn_port(
+        key(),
+        7,
+        path.to_path_buf(),
+        115200,
+        Default::default(),
+        policy,
+        tx,
+    );
     (h, rx)
 }
 
@@ -207,7 +215,15 @@ fn open_at_74880_succeeds() {
         dtr: false,
         rts: false,
     };
-    let _h = spawn_port(key(), 7, pty.path.clone(), 74880, policy, tx);
+    let _h = spawn_port(
+        key(),
+        7,
+        pty.path.clone(),
+        74880,
+        Default::default(),
+        policy,
+        tx,
+    );
     expect_opened(&rx);
 }
 
@@ -298,4 +314,31 @@ fn stuck_write_warns_and_keeps_port_open() {
         }
     }
     drop(h);
+}
+
+/// A pty forces 8N1 on its slave side, so the termios bits cannot be read
+/// back here (see `format_flags` unit tests). This checks that a worker
+/// started with another format opens and survives a format change.
+#[test]
+fn non_default_format_opens_and_set_format_keeps_worker_alive() {
+    use comrade::store::{Parity, SerialFormat};
+    let pty = make_pty();
+    let (tx, rx): (Sender<Event>, _) = unbounded();
+    let policy = LinePolicy {
+        dtr: false,
+        rts: false,
+    };
+    let h = spawn_port(
+        key(),
+        7,
+        pty.path.clone(),
+        115200,
+        SerialFormat::new(7, Parity::Even, 2),
+        policy,
+        tx,
+    );
+    expect_opened(&rx);
+    h.set_format(SerialFormat::new(8, Parity::Odd, 1));
+    h.write(b"x".to_vec());
+    h.close();
 }

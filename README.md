@@ -28,7 +28,7 @@ comrade
 
 That is all you need. comrade lists the USB serial ports that are already present and watches for new ones. It opens each port that belongs to a known microcontroller vendor.
 
-**Auto-connected vendors (by USB VID):** Espressif `303a`, Arduino `2341` and `2a03`, WCH/CH340 `1a86`, Silicon Labs CP210x `10c4`, FTDI `0403`, Raspberry Pi `2e8a`, Adafruit `239a`, SparkFun `1b4f`, STMicro `0483`, PJRC/Teensy `16c0` and Seeed `2886`.
+**Auto-connected vendors (by USB VID):** Espressif `303a`, Arduino `2341` and `2a03`, WCH/CH340 `1a86`, Silicon Labs CP210x `10c4`, FTDI `0403`, Raspberry Pi `2e8a`, Adafruit `239a`, SparkFun `1b4f`, STMicro `0483`, PJRC/Teensy `16c0`, Seeed `2886`, Prolific PL2303 `067b`, Nordic `1915` (its DFU PID `521f` is a bootloader), SEGGER J-Link `1366` and NXP `1fc9`.
 
 comrade never opens any other USB serial device on its own. A phone that shows up as `/dev/ttyACM0` is one example. Such devices are listed under `c` (other ports), and you can connect to them from there. comrade ignores non-USB ttys (`ttyS*`).
 
@@ -39,6 +39,7 @@ You never need a flag. These two exist only to override the defaults.
 | Flag | Effect |
 |---|---|
 | `--baud <rate>` | Sets the baud rate for boards that have no remembered rate. The default is 115200. |
+| `--log-dir <dir>` | Also appends every tab's lines to `<dir>/comrade-<board>-<YYYYMMDD-HHMMSS>.log` as they arrive (full date and time on each line, colour codes removed). The files survive a crash or kill. If the directory cannot be written, logging stops and the status line says why. |
 | `--port <path>` | Opens this port at startup even if it is not a known board, for example `--port /dev/ttyS0` or a pty. You can repeat it. |
 
 ### Screen
@@ -87,22 +88,30 @@ comrade never clears the scrollback on its own. It keeps the last 100 000 lines 
 | `1`–`9`, `Tab`/`Shift-Tab`, click | switch tab |
 | `↑↓ PgUp PgDn Home End`, wheel | scroll / follow |
 | `/` `n` `N` | search |
+| `f` | filter: show only the lines that match the kept search (`Esc` clears) |
 | `i` or `Enter` | focus send box |
-| `b` | baud picker (common rates 300…2 000 000 + custom) |
+| `I` (shift) | raw mode: every key goes straight to the board |
+| `b` | baud picker (common rates 300…2 000 000 + custom); `←` `→` there change data bits, parity and stop bits (8N1, 8E1, 7E1, …) |
 | `p` | manual pause/resume |
 | `r` | reset board |
 | `t` | toggle timestamps |
 | `w` | toggle wrap |
 | `c` | list other (non-allowlisted) ports, connect manually |
+| `y` | copy the bottom visible line (or the search hit) to the clipboard with OSC 52 |
+| `m` | mouse capture on/off; off lets the terminal select text |
 | `s` | save tab scrollback to `./comrade-<board>-<YYYYMMDD-HHMMSS>.log` |
 | `C` (shift) | clear tab scrollback |
 | `x` | close tab |
 | `?` | help overlay |
 | `q` / `Ctrl-C` | quit |
 
+`y` needs a terminal that supports OSC 52 (kitty, WezTerm, foot, Alacritty, iTerm2 and others; tmux needs `set -g set-clipboard on`). Lines over 75 000 bytes are not copied. While mouse capture is on, hold Shift to select text with the terminal, or press `m` to turn capture off.
+
 When you scroll up, the view freezes and shows `+N new`. Press `End` to follow again.
 
 The saved log is plain text, with colour codes removed. Each line has an `HH:MM:SS.mmm` prefix while timestamps are on.
+
+**Raw mode** (`I`): comrade sends every key to the board at once, as a terminal would. Arrows, `Tab`, `Backspace` and `Ctrl`-letters all work, so you can use a shell or REPL on the board (MicroPython, the ESP-IDF console, Zephyr shell) with history and completion. `Enter` sends the tab's line ending (`\r` if it is set to none). Pasted text goes through too. `Ctrl-]` leaves raw mode. `Ctrl-C` and `q` go to the board, not to comrade.
 
 **Send box:**
 
@@ -113,7 +122,7 @@ The saved log is plain text, with colour codes removed. Each line has an `HH:MM:
 
 ### What comrade remembers
 
-comrade remembers the baud rate and line ending for each board, keyed by the board's USB identity. It saves them to `$XDG_STATE_HOME/comrade/boards.toml` (by default `~/.local/state/comrade/boards.toml`) whenever you change them.
+comrade remembers the baud rate, the serial format (data bits, parity, stop bits; 8N1 by default) and the line ending for each board, keyed by the board's USB identity. It saves them to `$XDG_STATE_HOME/comrade/boards.toml` (by default `~/.local/state/comrade/boards.toml`) whenever you change them.
 
 If this file is missing or corrupt, comrade ignores it and writes a new one. A problem with the file never stops comrade from running.
 
@@ -123,9 +132,9 @@ When Linux opens a serial port, the kernel raises both DTR and RTS. Right after 
 
 | Family | Examples (VID:PID) | DTR | RTS | Why |
 |---|---|---|---|---|
-| UART bridge | CP210x `10c4`, CH340 `1a86`, FTDI `0403`, Uno/Mega 16U2 `2341:0043/0001/0010/0042/0243` and the same PIDs under `2a03`, ST-Link `0483` | off | off | On ESP32 boards with the two-transistor auto-reset circuit, DTR on with RTS off pulls IO0 low. The reset button would then start download mode. |
+| UART bridge | CP210x `10c4`, CH340 `1a86`, FTDI `0403`, PL2303 `067b`, Uno/Mega 16U2 `2341:0043/0001/0010/0042/0243` and the same PIDs under `2a03`, ST-Link `0483` | off | off | On ESP32 boards with the two-transistor auto-reset circuit, DTR on with RTS off pulls IO0 low. The reset button would then start download mode. |
 | ESP USB-Serial-JTAG | `303a:1001` (built into ESP32-S3, C3 and C6) | off | off | RTS on holds the chip in reset. |
-| Native USB CDC | Leonardo, Micro, Zero and other `2341`/`2a03` CDC PIDs (bit 15 set, e.g. `8036`, `804d`); SparkFun `1b4f`, Adafruit `239a` and Seeed `2886` PIDs with bit 15 set; RP2040 `2e8a`; Teensy `16c0`; other Espressif `303a` PIDs (TinyUSB) | on | off | These USB stacks treat DTR as "host is listening". Without it, `while (!Serial)` sketches and TinyUSB print nothing. |
+| Native USB CDC | Leonardo, Micro, Zero and other `2341`/`2a03` CDC PIDs (bit 15 set, e.g. `8036`, `804d`); SparkFun `1b4f`, Adafruit `239a` and Seeed `2886` PIDs with bit 15 set; RP2040 `2e8a`; Teensy `16c0`; Nordic `1915`, SEGGER `1366` and NXP `1fc9` CDC ports; other Espressif `303a` PIDs (TinyUSB) | on | off | These USB stacks treat DTR as "host is listening". Without it, `while (!Serial)` sketches and TinyUSB print nothing. |
 | Unknown / manual (`--port`, `c`) | anything else | on | off | Same as the pyserial and miniterm default. |
 
 **comrade resets ESP boards when they are plugged in, so the boot log is captured.** When an ESP USB-Serial-JTAG board, or a board behind a UART bridge other than Arduino's own (`2341`, `2a03`), is plugged in while comrade runs, comrade opens the port and then sends one reset pulse (see `r` below), with a `reset` separator. This also happens when such a board comes back after an unplug. It does not happen for boards that are already plugged in when comrade starts, when a board comes back after an upload (the uploader already reset it), or on a reconnect retry.
@@ -210,6 +219,7 @@ comrade never needs root.
 - A missing node (`ENOENT`, `ENODEV`, `ENXIO`) is not an error: the tab shows `○`. A `--port` path that does not exist yet is retried with the same backoff, so comrade connects once it appears.
 - A write that cannot go out within 2 s (for example, a full output buffer) is dropped. The tab shows `write timed out, N bytes dropped`, and the port stays open, so reading goes on.
 - On `q`, `Ctrl-C`, SIGTERM, SIGHUP or a panic, comrade restores the terminal. It leaves the alternate screen, turns off raw mode and mouse capture, and shows the cursor.
+- If a connection delivers 512 bytes of output that is not text (many control bytes or invalid UTF-8), comrade adds one note to the tab: `output does not look like text: wrong baud rate? now 115200, press b to change`. It shows once per connection and baud rate.
 - comrade renders only when something changed, and at most 60 times a second. During a flood of data it draws one frame for many batches. When nothing happens, it does not busy-wait.
 
 ## Hardware checklist

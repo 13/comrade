@@ -20,7 +20,23 @@ pub enum UiOutcome {
     Action(Action),
     Quit,
     Save,
+    /// Copy this text to the clipboard (OSC 52).
+    Copy(String),
+    /// Turn mouse capture on or off.
+    ToggleMouse,
     Redraw,
+}
+
+/// Scroll the filtered view by whole matches. `up` goes toward older matches.
+fn filter_scroll(view: &mut View, core: &Core, up: bool, n: usize) {
+    let last = core.tabs().get(core.focus()).map_or(0, |t| {
+        t.scroll.count_matches(&view.search).saturating_sub(1)
+    });
+    view.filter_skip = if up {
+        (view.filter_skip + n).min(last)
+    } else {
+        view.filter_skip.saturating_sub(n)
+    };
 }
 
 fn scroll_focused(core: &mut Core, f: impl FnOnce(&mut crate::scrollback::Scrollback)) {
@@ -98,6 +114,9 @@ pub fn on_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
     if key.kind == KeyEventKind::Release {
         return UiOutcome::None;
     }
+    if view.mode == Mode::Raw {
+        return raw_key(view, core, key);
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     if ctrl && key.code == KeyCode::Char('c') {
         return UiOutcome::Quit;
@@ -105,6 +124,8 @@ pub fn on_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
     if key.code == KeyCode::Esc {
         if view.mode == Mode::Log {
             view.search.clear();
+            view.filter = false;
+            view.filter_skip = 0;
         }
         if view.mode == Mode::Search && view.search.is_empty() {
             search_incremental(view, core);
@@ -116,8 +137,9 @@ pub fn on_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
     match view.mode {
         Mode::Log => log_key(view, core, key),
         Mode::Send => send_key(view, key),
+        Mode::Raw => UiOutcome::None,
         Mode::Search => search_key(view, core, key),
-        Mode::BaudPicker => baud_key(view, key),
+        Mode::BaudPicker => baud_key(view, core, key),
         Mode::OtherPorts => ports_key(view, core, key),
         Mode::Help => {
             view.mode = Mode::Log;
@@ -136,32 +158,60 @@ fn log_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
         KeyCode::Tab => UiOutcome::Action(Action::NextTab),
         KeyCode::BackTab => UiOutcome::Action(Action::PrevTab),
         KeyCode::Up => {
-            scroll_focused(core, |s| s.scroll_up(1));
+            if view.filtering() {
+                filter_scroll(view, core, true, 1)
+            } else {
+                scroll_focused(core, |s| s.scroll_up(1))
+            }
             UiOutcome::Redraw
         }
         KeyCode::Down => {
-            scroll_focused(core, |s| s.scroll_down(1));
+            if view.filtering() {
+                filter_scroll(view, core, false, 1)
+            } else {
+                scroll_focused(core, |s| s.scroll_down(1))
+            }
             UiOutcome::Redraw
         }
         KeyCode::PageUp => {
-            scroll_focused(core, |s| s.scroll_up(page));
+            if view.filtering() {
+                filter_scroll(view, core, true, page)
+            } else {
+                scroll_focused(core, |s| s.scroll_up(page))
+            }
             UiOutcome::Redraw
         }
         KeyCode::PageDown => {
-            scroll_focused(core, |s| s.scroll_down(page));
+            if view.filtering() {
+                filter_scroll(view, core, false, page)
+            } else {
+                scroll_focused(core, |s| s.scroll_down(page))
+            }
             UiOutcome::Redraw
         }
         KeyCode::Home => {
-            scroll_focused(core, |s| s.home());
+            if view.filtering() {
+                filter_scroll(view, core, true, usize::MAX / 2)
+            } else {
+                scroll_focused(core, |s| s.home())
+            }
             UiOutcome::Redraw
         }
         KeyCode::End => {
-            scroll_focused(core, |s| s.end());
+            if view.filtering() {
+                view.filter_skip = 0
+            } else {
+                scroll_focused(core, |s| s.end())
+            }
             UiOutcome::Redraw
         }
         KeyCode::Enter | KeyCode::Char('i') => {
             view.mode = Mode::Send;
             view.hist_idx = None;
+            UiOutcome::Redraw
+        }
+        KeyCode::Char('I') => {
+            view.mode = Mode::Raw;
             UiOutcome::Redraw
         }
         KeyCode::Char('/') => {
@@ -210,6 +260,26 @@ fn log_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
             UiOutcome::Redraw
         }
         KeyCode::Char('s') => UiOutcome::Save,
+        KeyCode::Char('f') => {
+            if view.search.is_empty() {
+                view.filter = false;
+                view.set_status("filter: search first with /, then press f");
+            } else {
+                view.filter = !view.filter;
+                view.filter_skip = 0;
+            }
+            UiOutcome::Redraw
+        }
+        KeyCode::Char('m') => UiOutcome::ToggleMouse,
+        KeyCode::Char('y') => {
+            let i = core.focus();
+            core.tabs()
+                .get(i)
+                .and_then(|t| t.scroll.get(t.scroll.position()))
+                .map_or(UiOutcome::None, |l| {
+                    UiOutcome::Copy(crate::scrollback::strip_sgr(&l.text).into_owned())
+                })
+        }
         KeyCode::Char('C') => UiOutcome::Action(Action::ClearTab),
         KeyCode::Char('x') => UiOutcome::Action(Action::CloseTab),
         KeyCode::Char('?') => {
@@ -218,6 +288,56 @@ fn log_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
         }
         KeyCode::Char('q') => UiOutcome::Quit,
         _ => UiOutcome::None,
+    }
+}
+
+/// The bytes a key press sends to the board in raw mode, like a terminal
+/// would: control letters, arrows and Home/End as ANSI sequences.
+fn raw_bytes(core: &Core, key: KeyEvent) -> Vec<u8> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let mut out = match key.code {
+        KeyCode::Char(c) if ctrl && c.is_ascii_alphabetic() => {
+            vec![c.to_ascii_lowercase() as u8 - b'a' + 1]
+        }
+        KeyCode::Char('[') if ctrl => vec![0x1b],
+        KeyCode::Char('\\') if ctrl => vec![0x1c],
+        KeyCode::Char('^') if ctrl => vec![0x1e],
+        KeyCode::Char('_') if ctrl => vec![0x1f],
+        KeyCode::Char(c) => c.to_string().into_bytes(),
+        KeyCode::Enter => core.raw_enter().to_vec(),
+        KeyCode::Tab => b"\t".to_vec(),
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Up => b"\x1b[A".to_vec(),
+        KeyCode::Down => b"\x1b[B".to_vec(),
+        KeyCode::Right => b"\x1b[C".to_vec(),
+        KeyCode::Left => b"\x1b[D".to_vec(),
+        KeyCode::Home => b"\x1b[H".to_vec(),
+        KeyCode::End => b"\x1b[F".to_vec(),
+        KeyCode::Delete => b"\x1b[3~".to_vec(),
+        KeyCode::PageUp => b"\x1b[5~".to_vec(),
+        KeyCode::PageDown => b"\x1b[6~".to_vec(),
+        _ => return Vec::new(),
+    };
+    if alt && !out.is_empty() && !matches!(key.code, KeyCode::Esc) {
+        out.insert(0, 0x1b);
+    }
+    out
+}
+
+/// Raw mode: only `Ctrl-]` is kept for comrade; everything else is sent.
+fn raw_key(view: &mut View, core: &Core, key: KeyEvent) -> UiOutcome {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(']') {
+        view.mode = Mode::Log;
+        return UiOutcome::Redraw;
+    }
+    let bytes = raw_bytes(core, key);
+    if bytes.is_empty() {
+        UiOutcome::None
+    } else {
+        UiOutcome::Action(Action::SendRaw(bytes))
     }
 }
 
@@ -284,11 +404,13 @@ fn search_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
     match key.code {
         KeyCode::Char(c) => {
             view.search.push(c);
+            view.filter_skip = 0;
             search_incremental(view, core);
             UiOutcome::Redraw
         }
         KeyCode::Backspace => {
             view.search.pop();
+            view.filter_skip = 0;
             search_incremental(view, core);
             UiOutcome::Redraw
         }
@@ -304,7 +426,7 @@ fn search_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
     }
 }
 
-fn baud_key(view: &mut View, key: KeyEvent) -> UiOutcome {
+fn baud_key(view: &mut View, core: &Core, key: KeyEvent) -> UiOutcome {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return UiOutcome::None;
     }
@@ -317,6 +439,13 @@ fn baud_key(view: &mut View, key: KeyEvent) -> UiOutcome {
             view.picker_idx = (view.picker_idx + 1).min(BAUDS.len());
             UiOutcome::Redraw
         }
+        // Data bits, parity and stop bits apply at once and stay in the picker.
+        KeyCode::Left | KeyCode::Right => match core.tabs().get(core.focus()) {
+            Some(t) => {
+                UiOutcome::Action(Action::SetFormat(t.format.step(key.code == KeyCode::Right)))
+            }
+            None => UiOutcome::None,
+        },
         KeyCode::Char(c) if c.is_ascii_digit() => {
             view.picker_idx = BAUDS.len();
             if view.custom_baud.len() < 9 {
@@ -373,11 +502,19 @@ pub fn on_mouse(view: &mut View, core: &mut Core, ev: MouseEvent) -> UiOutcome {
     }
     match ev.kind {
         MouseEventKind::ScrollUp => {
-            scroll_focused(core, |s| s.scroll_up(3));
+            if view.filtering() {
+                filter_scroll(view, core, true, 3);
+            } else {
+                scroll_focused(core, |s| s.scroll_up(3));
+            }
             UiOutcome::Redraw
         }
         MouseEventKind::ScrollDown => {
-            scroll_focused(core, |s| s.scroll_down(3));
+            if view.filtering() {
+                filter_scroll(view, core, false, 3);
+            } else {
+                scroll_focused(core, |s| s.scroll_down(3));
+            }
             UiOutcome::Redraw
         }
         MouseEventKind::Down(MouseButton::Left) if ev.row == 0 => view
@@ -393,6 +530,10 @@ pub fn on_mouse(view: &mut View, core: &mut Core, ev: MouseEvent) -> UiOutcome {
 }
 
 pub fn on_paste(view: &mut View, s: &str) -> UiOutcome {
+    if view.mode == Mode::Raw {
+        let bytes: Vec<u8> = s.replace("\r\n", "\r").replace('\n', "\r").into_bytes();
+        return UiOutcome::Action(Action::SendRaw(bytes));
+    }
     if view.mode != Mode::Send {
         return UiOutcome::None;
     }

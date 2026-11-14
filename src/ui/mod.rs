@@ -57,11 +57,30 @@ fn spans_width(spans: &[Span]) -> usize {
     spans.iter().map(|s| s.content.width()).sum()
 }
 
+/// Below this size the layout is cramped, so comrade shows a note instead.
+const MIN_W: u16 = 40;
+const MIN_H: u16 = 8;
+
 pub fn render(f: &mut Frame, core: &Core, view: &View) {
     let area = f.area();
     view.tab_hits.borrow_mut().clear();
     if area.width == 0 || area.height == 0 {
         view.last_log_rows.set(0);
+        return;
+    }
+    if area.width < MIN_W || area.height < MIN_H {
+        view.last_log_rows.set(0);
+        let msg = format!(
+            "terminal too small\n{}x{}, need at least {MIN_W}x{MIN_H}",
+            area.width, area.height
+        );
+        f.render_widget(
+            Paragraph::new(msg)
+                .style(theme::warn())
+                .alignment(Alignment::Center)
+                .wrap(ratatui::widgets::Wrap { trim: true }),
+            area,
+        );
         return;
     }
     let [bar, rule, log, rule2, send, status] = Layout::vertical([
@@ -143,7 +162,7 @@ fn render_bar(f: &mut Frame, core: &Core, tab: Option<&Tab>, view: &View, r: Rec
                 t.baud.to_string(),
                 Style::new().add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" 8N1 ", theme::muted()),
+            Span::styled(format!(" {} ", t.format), theme::muted()),
         ],
         None => vec![],
     };
@@ -366,9 +385,20 @@ fn render_log(f: &mut Frame, tab: Option<&Tab>, view: &View, r: Rect) {
     let ts = view.timestamps && body.width > TS_WIDTH;
     let ts_w = if ts { TS_WIDTH } else { 0 };
     let body_w = body.width.saturating_sub(ts_w).max(1);
-    let rows = tab
-        .scroll
-        .visible(body.height, body.width, view.wrap, tab.asm.partial(), ts_w);
+    let filtering = view.filtering();
+    let rows = if filtering {
+        tab.scroll.visible_filtered(
+            &view.search,
+            view.filter_skip,
+            body.height,
+            body.width,
+            view.wrap,
+            ts_w,
+        )
+    } else {
+        tab.scroll
+            .visible(body.height, body.width, view.wrap, tab.asm.partial(), ts_w)
+    };
     let lines: Vec<TLine> = rows
         .iter()
         .map(|row| {
@@ -385,6 +415,24 @@ fn render_log(f: &mut Frame, tab: Option<&Tab>, view: &View, r: Rect) {
         .collect();
     f.render_widget(Paragraph::new(lines), body);
 
+    if filtering && r.height > 0 {
+        let msg = if view.filter_skip > 0 {
+            format!(" filter \"{}\" · older · End newest ", view.search)
+        } else {
+            format!(" filter \"{}\" · f off ", view.search)
+        };
+        let w = (msg.width() as u16).min(body.width);
+        f.render_widget(
+            Paragraph::new(msg).style(theme::pill()),
+            Rect {
+                x: body.right() - w,
+                y: r.bottom() - 1,
+                width: w,
+                height: 1,
+            },
+        );
+        return;
+    }
     if tab.scroll.follow() || r.height == 0 {
         return;
     }
@@ -422,6 +470,20 @@ fn render_log(f: &mut Frame, tab: Option<&Tab>, view: &View, r: Rect) {
 }
 
 fn render_send(f: &mut Frame, tab: Option<&Tab>, view: &View, r: Rect) {
+    if view.mode == Mode::Raw {
+        f.render_widget(
+            Paragraph::new(TLine::from(vec![
+                Span::styled(" ⌨", theme::warn().add_modifier(Modifier::BOLD)),
+                Span::raw(" "),
+                Span::styled(
+                    "raw mode: every key goes to the board, Ctrl-] leaves",
+                    theme::warn(),
+                ),
+            ])),
+            r,
+        );
+        return;
+    }
     let active = matches!(view.mode, Mode::Send | Mode::Search);
     let right: Vec<Span> = match view.mode {
         Mode::Search => vec![
@@ -488,6 +550,7 @@ fn mode_badge(mode: Mode) -> (&'static str, Color) {
     match mode {
         Mode::Log => (" LOG ", Color::Blue),
         Mode::Send => (" SEND ", Color::Green),
+        Mode::Raw => (" RAW ", Color::Red),
         Mode::Search => (" SEARCH ", Color::Yellow),
         Mode::BaudPicker => (" BAUD ", Color::Magenta),
         Mode::OtherPorts => (" PORTS ", Color::Magenta),
@@ -520,6 +583,7 @@ fn hints(view: &View, tab: Option<&Tab>) -> Vec<(&'static str, &'static str)> {
             ("↑↓", "history"),
             ("Esc", "back"),
         ],
+        Mode::Raw => vec![("^]", "leave raw mode")],
         Mode::Search => vec![("Enter", "keep"), ("Esc", "cancel")],
         Mode::BaudPicker | Mode::OtherPorts => {
             vec![("↑↓", "select"), ("Enter", "apply"), ("Esc", "cancel")]
@@ -533,11 +597,13 @@ fn hints(view: &View, tab: Option<&Tab>) -> Vec<(&'static str, &'static str)> {
             }
             if !view.search.is_empty() {
                 h.push(("n/N", "next/prev"));
+                h.push(("f", if view.filter { "unfilter" } else { "filter" }));
             }
             h.extend([
                 ("?", "help"),
                 ("/", "search"),
                 ("i", "send"),
+                ("I", "raw"),
                 ("b", "baud"),
                 ("p", "pause"),
                 ("r", "reset"),
@@ -673,7 +739,11 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Board",
         &[
+            ("y", "copy the bottom line to the clipboard"),
+            ("m", "mouse on/off (off: select text with the terminal)"),
+            ("f", "filter: show only lines that match the search"),
             ("i Enter", "focus send box"),
+            ("I", "raw mode: keys go to the board, Ctrl-] leaves"),
             ("b", "baud picker"),
             ("p", "pause / resume"),
             ("r", "reset board"),
@@ -789,8 +859,11 @@ fn overlay_baud(f: &mut Frame, tab: Option<&Tab>, view: &View, area: Rect) {
     picker(
         f,
         area,
-        "Baud rate",
-        &[("Enter", "apply"), ("Esc", "cancel")],
+        &format!(
+            "Baud rate · format {}",
+            tab.map(|t| t.format).unwrap_or_default()
+        ),
+        &[("Enter", "apply"), ("←→", "format"), ("Esc", "cancel")],
         items,
         view.picker_idx,
         36,
@@ -893,6 +966,96 @@ mod tests {
     }
     fn ch(c: char) -> KeyEvent {
         key(KeyCode::Char(c))
+    }
+
+    #[test]
+    fn raw_mode_sends_keys_and_ctrl_bracket_leaves() {
+        let mut c = core_with(1);
+        let mut v = View::new();
+        assert_eq!(on_key(&mut v, &mut c, ch('I')), UiOutcome::Redraw);
+        assert_eq!(v.mode, Mode::Raw);
+        let send = |b: &[u8]| UiOutcome::Action(Action::SendRaw(b.to_vec()));
+        assert_eq!(on_key(&mut v, &mut c, ch('q')), send(b"q"));
+        assert_eq!(on_key(&mut v, &mut c, key(KeyCode::Up)), send(b"\x1b[A"));
+        assert_eq!(on_key(&mut v, &mut c, key(KeyCode::Tab)), send(b"\t"));
+        assert_eq!(on_key(&mut v, &mut c, key(KeyCode::Esc)), send(b"\x1b"));
+        let ctrl = |k| KeyEvent::new(k, KeyModifiers::CONTROL);
+        // Ctrl-C reaches the board instead of quitting comrade.
+        assert_eq!(on_key(&mut v, &mut c, ctrl(KeyCode::Char('c'))), send(&[3]));
+        assert_eq!(on_paste(&mut v, "a\nb"), send(b"a\rb"));
+        assert_eq!(
+            on_key(&mut v, &mut c, ctrl(KeyCode::Char(']'))),
+            UiOutcome::Redraw
+        );
+        assert_eq!(v.mode, Mode::Log);
+    }
+
+    #[test]
+    fn y_copies_bottom_line_and_m_toggles_mouse() {
+        let mut c = core_with(1);
+        let mut v = View::new();
+        assert_eq!(on_key(&mut v, &mut c, ch('y')), UiOutcome::None);
+        c.tabs_mut()[0].scroll.push(crate::lines::Line {
+            at: chrono::Local::now(),
+            kind: crate::lines::LineKind::Data,
+            text: "\x1b[31mhello\x1b[0m".into(),
+        });
+        assert_eq!(
+            on_key(&mut v, &mut c, ch('y')),
+            UiOutcome::Copy("hello".into())
+        );
+        assert_eq!(on_key(&mut v, &mut c, ch('m')), UiOutcome::ToggleMouse);
+    }
+
+    #[test]
+    fn f_filters_to_search_matches() {
+        let mut c = core_with(1);
+        let mut v = View::new();
+        for t in ["alpha", "beta", "alpha two", "gamma"] {
+            c.tabs_mut()[0].scroll.push(crate::lines::Line {
+                at: chrono::Local::now(),
+                kind: crate::lines::LineKind::Data,
+                text: t.into(),
+            });
+        }
+        // No search yet: f does nothing but explain.
+        on_key(&mut v, &mut c, ch('f'));
+        assert!(!v.filter);
+        for k in "/alpha".chars() {
+            on_key(&mut v, &mut c, ch(k));
+        }
+        on_key(&mut v, &mut c, key(KeyCode::Enter));
+        on_key(&mut v, &mut c, ch('f'));
+        assert!(v.filter);
+        let rows = draw(&c, &v, 60, 10);
+        let body = rows.join("\n");
+        assert!(body.contains("alpha two"), "{body}");
+        assert!(!body.contains("beta") && !body.contains("gamma"), "{body}");
+        assert!(body.contains("filter \"alpha\""));
+        on_key(&mut v, &mut c, key(KeyCode::Esc));
+        assert!(!v.filter && v.search.is_empty());
+        assert!(draw(&c, &v, 60, 10).join("\n").contains("gamma"));
+    }
+
+    #[test]
+    fn tiny_terminal_shows_a_note() {
+        let c = core_with(1);
+        let v = View::new();
+        let rows = draw(&c, &v, 30, 6).join("\n");
+        assert!(rows.contains("terminal too small"), "{rows}");
+        assert!(rows.contains("30x6"));
+        let rows = draw(&c, &v, 40, 8).join("\n");
+        assert!(!rows.contains("too small"));
+    }
+
+    #[test]
+    fn raw_mode_row_and_badge() {
+        let c = core_with(1);
+        let mut v = View::new();
+        v.mode = Mode::Raw;
+        let rows = draw(&c, &v, 80, 10);
+        assert!(rows.iter().any(|r| r.contains("RAW")));
+        assert!(rows.iter().any(|r| r.contains("Ctrl-] leaves")));
     }
 
     #[test]
@@ -1052,6 +1215,18 @@ mod tests {
             ),
             UiOutcome::Quit
         );
+    }
+
+    #[test]
+    fn baud_picker_left_right_changes_format() {
+        let mut c = core_with(1);
+        let mut v = View::new();
+        on_key(&mut v, &mut c, ch('b'));
+        assert_eq!(
+            on_key(&mut v, &mut c, key(KeyCode::Right)),
+            UiOutcome::Action(Action::SetFormat("8E1".parse().unwrap()))
+        );
+        assert_eq!(v.mode, Mode::BaudPicker);
     }
 
     #[test]
@@ -1272,7 +1447,14 @@ mod tests {
             .push(line("\x1b[31mabcdefghij\x1b[0m", LineKind::Data));
         let mut v = View::new();
         v.timestamps = false;
-        let rows = draw(&c, &v, 5, 12);
+        // The log area alone: a whole screen this narrow shows the "too small" note.
+        let mut t = Terminal::new(TestBackend::new(5, 12)).unwrap();
+        t.draw(|f| render_log(f, c.tabs().first(), &v, f.area()))
+            .unwrap();
+        let buf = t.backend().buffer().clone();
+        let rows: Vec<String> = (0..12)
+            .map(|y| (0..5).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
         assert!(rows.iter().any(|r| r.starts_with("abcde")));
         assert!(rows.iter().any(|r| r.starts_with("fghij")));
     }
@@ -1286,7 +1468,8 @@ mod tests {
         let mut v = View::new();
         v.timestamps = false;
         let mut t = Terminal::new(TestBackend::new(5, 12)).unwrap();
-        t.draw(|f| render(f, &c, &v)).unwrap();
+        t.draw(|f| render_log(f, c.tabs().first(), &v, f.area()))
+            .unwrap();
         let buf = t.backend().buffer();
         let red = (0..12).filter(|&y| buf[(0, y)].symbol() == "f").count();
         assert_eq!(red, 1);

@@ -12,6 +12,7 @@ use std::ops::Range;
 use unicode_width::UnicodeWidthChar;
 
 use crate::lines::Line;
+use crate::lines::LineKind;
 
 pub struct VisibleRow<'a> {
     pub line: &'a Line,
@@ -116,6 +117,11 @@ impl Scrollback {
         self.follow = true;
         self.anchor = self.dropped;
         self.new_since_freeze = 0;
+    }
+
+    /// Lines pushed since creation, including those dropped or cleared.
+    pub fn total(&self) -> u64 {
+        self.dropped + self.lines.len() as u64
     }
 
     pub fn len(&self) -> usize {
@@ -278,6 +284,68 @@ impl Scrollback {
         out
     }
 
+    fn matches(&self, i: usize, needle_lc: &str) -> bool {
+        let l = &self.lines[i];
+        l.kind != LineKind::Separator && strip_sgr(&l.text).to_lowercase().contains(needle_lc)
+    }
+
+    /// Number of lines that contain `needle` (case-insensitive, separators excluded).
+    pub fn count_matches(&self, needle: &str) -> usize {
+        let n = needle.to_lowercase();
+        (0..self.lines.len())
+            .filter(|&i| self.matches(i, &n))
+            .count()
+    }
+
+    /// The bottom `rows` display rows of the lines that contain `needle`,
+    /// skipping the newest `skip` matches. Scans from the newest line and
+    /// stops once the rows are full.
+    pub fn visible_filtered<'a>(
+        &'a self,
+        needle: &str,
+        skip: usize,
+        rows: u16,
+        cols: u16,
+        wrap: bool,
+        ts_width: u16,
+    ) -> Vec<VisibleRow<'a>> {
+        let rows = rows as usize;
+        let tw = (cols.saturating_sub(ts_width) as usize).max(1);
+        let n = needle.to_lowercase();
+        let mut out: Vec<VisibleRow<'a>> = Vec::with_capacity(rows);
+        let mut skipped = 0;
+        for i in (0..self.lines.len()).rev() {
+            if out.len() >= rows {
+                break;
+            }
+            if !self.matches(i, &n) {
+                continue;
+            }
+            if skipped < skip {
+                skipped += 1;
+                continue;
+            }
+            let line = &self.lines[i];
+            let h = if wrap {
+                row_count(&strip_sgr(&line.text), tw)
+            } else {
+                1
+            };
+            for segment in (0..h).rev() {
+                if out.len() == rows {
+                    break;
+                }
+                out.push(VisibleRow {
+                    line,
+                    segment,
+                    is_partial: false,
+                });
+            }
+        }
+        out.reverse();
+        out
+    }
+
     /// Case-insensitive search over SGR-stripped text. `from` is inclusive;
     /// no wrap-around. Returns a buffer index.
     pub fn search(&self, needle: &str, from: usize, forward: bool) -> Option<usize> {
@@ -319,6 +387,27 @@ mod tests {
         }
         s
     }
+    #[test]
+    fn filtered_view_shows_only_matches_newest_last() {
+        let mut s = Scrollback::new(100);
+        for t in ["boot", "ERROR a", "ok", "error b", "ok", "Error c"] {
+            s.push(l(t));
+        }
+        let texts = |skip| {
+            s.visible_filtered("error", skip, 10, 80, true, 0)
+                .iter()
+                .map(|r| r.line.text.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts(0), ["ERROR a", "error b", "Error c"]);
+        assert_eq!(texts(1), ["ERROR a", "error b"]);
+        assert_eq!(s.count_matches("ERROR"), 3);
+        // Only as many rows as fit, the newest ones.
+        let r = s.visible_filtered("error", 0, 2, 80, true, 0);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[1].line.text, "Error c");
+    }
+
     #[test]
     fn wrap_segments_matches_row_count() {
         for t in [

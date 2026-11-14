@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::board::{BoardKey, DeviceInfo, Family, LinePolicy};
+use crate::store::SerialFormat;
 
 pub type ConnId = u64;
 
@@ -77,6 +78,7 @@ pub enum Command {
         conn: ConnId,
         devnode: PathBuf,
         baud: u32,
+        format: SerialFormat,
         policy: LinePolicy,
     },
     Close {
@@ -89,6 +91,10 @@ pub enum Command {
     SetBaud {
         key: BoardKey,
         baud: u32,
+    },
+    SetFormat {
+        key: BoardKey,
+        format: SerialFormat,
     },
     ResetPulse {
         key: BoardKey,

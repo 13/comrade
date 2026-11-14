@@ -43,6 +43,9 @@ const ARDUINO_BRIDGE_PIDS: [u16; 5] = [0x0043, 0x0001, 0x0243, 0x0010, 0x0042];
 /// bit 15 set, so the high-bit rule below would not catch them.
 const SPARKFUN_BOOT_PIDS: [u16; 3] = [0x9203, 0x9205, 0x9207];
 
+/// Nordic open bootloader (nRF52840 dongle DFU).
+const NORDIC_BOOT_PID: u16 = 0x521f;
+
 /// Native-USB vendors that follow the Arduino PID convention: the
 /// application (CDC) PID has bit 15 set, the bootloader PID has it clear
 /// (Caterina `2341:0036`, SAMD `2341:004d`, Adafruit UF2/SAMD `239a:000b`,
@@ -57,7 +60,7 @@ fn by_high_bit(pid: u16) -> Class {
 
 pub fn classify(vid: u16, pid: u16) -> Class {
     match vid {
-        0x10c4 | 0x1a86 | 0x0403 | 0x0483 => Class::Auto(Family::UartBridge),
+        0x10c4 | 0x1a86 | 0x0403 | 0x0483 | 0x067b => Class::Auto(Family::UartBridge),
         0x2341 | 0x2a03 if ARDUINO_BRIDGE_PIDS.contains(&pid) => Class::Auto(Family::UartBridge),
         0x1b4f if SPARKFUN_BOOT_PIDS.contains(&pid) => Class::Bootloader,
         0x2341 | 0x2a03 | 0x239a | 0x1b4f | 0x2886 => by_high_bit(pid),
@@ -66,6 +69,11 @@ pub fn classify(vid: u16, pid: u16) -> Class {
             _ => Class::Auto(Family::NativeCdc),
         },
         0x2e8a | 0x16c0 => Class::Auto(Family::NativeCdc),
+        // Nordic: the open bootloader (DFU) has its own PID.
+        0x1915 if pid == NORDIC_BOOT_PID => Class::Bootloader,
+        // Nordic CDC firmware, SEGGER J-Link and NXP MCU-Link debug probes:
+        // CDC ports where DTR means "host is listening".
+        0x1915 | 0x1366 | 0x1fc9 => Class::Auto(Family::NativeCdc),
         _ => Class::Other,
     }
 }
@@ -118,6 +126,7 @@ pub fn friendly_name(d: &DeviceInfo) -> String {
         (0x10c4, _) => Some("CP210x"),
         (0x0403, _) => Some("FTDI"),
         (0x2e8a, _) => Some("RP2040"),
+        (0x067b, _) => Some("PL2303"),
         _ => None,
     };
     if let Some(n) = known {
@@ -172,6 +181,11 @@ mod tests {
         assert_eq!(classify(0x1b4f, 0x9205), Class::Bootloader);
         assert_eq!(classify(0x1b4f, 0x0001), Class::Bootloader);
         assert_eq!(classify(0x2e8a, 0x000a), Class::Auto(Family::NativeCdc));
+        assert_eq!(classify(0x067b, 0x2303), Class::Auto(Family::UartBridge));
+        assert_eq!(classify(0x1366, 0x1055), Class::Auto(Family::NativeCdc));
+        assert_eq!(classify(0x1fc9, 0x0143), Class::Auto(Family::NativeCdc));
+        assert_eq!(classify(0x1915, 0xc00a), Class::Auto(Family::NativeCdc));
+        assert_eq!(classify(0x1915, 0x521f), Class::Bootloader);
     }
     #[test]
     fn bootloader_pids_by_high_bit() {

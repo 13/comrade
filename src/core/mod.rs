@@ -13,7 +13,7 @@ use crate::board::{
 use crate::event::{Command, ConnId, Event, Holder, Now, OpenError};
 use crate::lines::{Line, LineAssembler, LineKind};
 use crate::scrollback::{Scrollback, strip_sgr};
-use crate::store::{BoardPrefs, LineEnding};
+use crate::store::{BoardPrefs, LineEnding, SerialFormat};
 use pause::PauseTracker;
 
 const SCROLLBACK_CAP: usize = 100_000;
@@ -48,11 +48,13 @@ pub struct Tab {
     pub state: TabState,
     pub baud: u32,
     pub line_ending: LineEnding,
+    pub format: SerialFormat,
     pub scroll: Scrollback,
     pub asm: LineAssembler,
     pub conn: ConnId,
     pub highlight: bool,
     pub rx_bytes: u64,
+    guard: crate::baud_hint::BaudGuard,
     ever_connected: bool,
     data_this_conn: bool,
     /// Completed non-banner lines still to see before a banner counts as a new reset.
@@ -80,7 +82,10 @@ pub enum Action {
     NextTab,
     PrevTab,
     Send(String),
+    /// Bytes written as they are, with no line ending added.
+    SendRaw(Vec<u8>),
     SetBaud(u32),
+    SetFormat(SerialFormat),
     TogglePause,
     Reset,
     ClearTab,
@@ -369,13 +374,28 @@ impl Core {
                 }
             }
             Action::Send(s) => self.send(s, now, &mut cmds),
+            Action::SendRaw(b) => self.send_raw(b, &mut cmds),
             Action::SetBaud(baud) => {
                 if let Some(t) = self.tabs.get_mut(self.focus) {
                     t.baud = baud;
+                    t.guard.reset();
                     if t.state == TabState::Connected {
                         cmds.push(Command::SetBaud {
                             key: t.key.clone(),
                             baud,
+                        });
+                    }
+                    self.persist(&mut cmds);
+                }
+            }
+            Action::SetFormat(format) => {
+                if let Some(t) = self.tabs.get_mut(self.focus) {
+                    t.format = format;
+                    t.guard.reset();
+                    if t.state == TabState::Connected {
+                        cmds.push(Command::SetFormat {
+                            key: t.key.clone(),
+                            format,
                         });
                     }
                     self.persist(&mut cmds);
@@ -411,6 +431,7 @@ impl Core {
                         });
                         t.scroll.push(separator(now, "reset"));
                         t.data_this_conn = false;
+                        t.guard.reset();
                     } else {
                         t.scroll
                             .push(line(now, LineKind::Info, "not connected".into()));
@@ -485,9 +506,9 @@ impl Core {
         if let Some(i) = self.tabs.iter().position(|t| t.key == key) {
             return i;
         }
-        let (baud, line_ending) = match self.prefs.get(&key) {
-            Some(p) => (p.baud, p.line_ending),
-            None => (self.default_baud, LineEnding::Lf),
+        let (baud, line_ending, format) = match self.prefs.get(&key) {
+            Some(p) => (p.baud, p.line_ending, p.format),
+            None => (self.default_baud, LineEnding::Lf, SerialFormat::default()),
         };
         let focused_connected = self
             .tabs
@@ -501,11 +522,13 @@ impl Core {
             state: TabState::Waiting,
             baud,
             line_ending,
+            format,
             scroll: Scrollback::new(SCROLLBACK_CAP),
             asm: LineAssembler::new(),
             conn: 0,
             highlight: false,
             rx_bytes: 0,
+            guard: Default::default(),
             ever_connected: false,
             data_this_conn: false,
             banner_quiet: 0,
@@ -538,6 +561,7 @@ impl Core {
         t.conn = conn;
         t.state = TabState::Connecting;
         t.data_this_conn = false;
+        t.guard.reset();
         t.retry_at = None;
         t.await_unblock = false;
         // `--port` / `c` paths are not udev-tracked: the node may have been
@@ -554,6 +578,7 @@ impl Core {
             conn,
             devnode: path,
             baud: t.baud,
+            format: t.format,
             policy,
         });
     }
@@ -802,6 +827,16 @@ impl Core {
             return;
         }
         t.rx_bytes += bytes.len() as u64;
+        if t.guard.push(bytes) {
+            t.scroll.push(line(
+                now,
+                LineKind::Info,
+                format!(
+                    "output does not look like text: wrong baud rate? now {}, press b to change",
+                    t.baud
+                ),
+            ));
+        }
         let pushed = t.asm.push(bytes, now.wall);
         let had_data = t.data_this_conn;
         for l in pushed.complete {
@@ -843,6 +878,29 @@ impl Core {
         });
     }
 
+    /// Write bytes from raw mode. A tab that is not connected drops them
+    /// silently: a note per key press would flood the scrollback.
+    fn send_raw(&mut self, bytes: Vec<u8>, cmds: &mut Vec<Command>) {
+        let Some(t) = self.tabs.get(self.focus) else {
+            return;
+        };
+        if t.state == TabState::Connected && !bytes.is_empty() {
+            cmds.push(Command::Write {
+                key: t.key.clone(),
+                bytes,
+            });
+        }
+    }
+
+    /// What the Enter key sends in raw mode, from the tab's line ending.
+    pub fn raw_enter(&self) -> &'static [u8] {
+        match self.tabs.get(self.focus).map(|t| t.line_ending) {
+            Some(LineEnding::Lf) => b"\n",
+            Some(LineEnding::CrLf) => b"\r\n",
+            _ => b"\r",
+        }
+    }
+
     fn persist(&mut self, cmds: &mut Vec<Command>) {
         let Some(t) = self.tabs.get(self.focus) else {
             return;
@@ -850,6 +908,7 @@ impl Core {
         let prefs = BoardPrefs {
             baud: t.baud,
             line_ending: t.line_ending,
+            format: t.format,
         };
         self.prefs.insert(t.key.clone(), prefs.clone());
         cmds.push(Command::Persist {
@@ -1162,6 +1221,47 @@ mod tests {
     }
 
     #[test]
+    fn garbage_output_shows_wrong_baud_note_once() {
+        let mut c = core();
+        let (key, conn) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        let mut x: u32 = 7;
+        let noise: Vec<u8> = (0..1024)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x >> 24) as u8
+            })
+            .collect();
+        data(&mut c, &key, conn, &noise);
+        data(&mut c, &key, conn, &noise);
+        let notes = texts(&c.tabs()[0])
+            .iter()
+            .filter(|l| l.contains("wrong baud rate"))
+            .count();
+        assert_eq!(notes, 1);
+    }
+
+    #[test]
+    fn send_raw_writes_bytes_unchanged_and_only_when_connected() {
+        let mut c = core();
+        let (key, _) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        let cmds = c.action(Action::SendRaw(vec![0x1b, b'[', b'A']), now(2));
+        assert_eq!(
+            cmds,
+            vec![Command::Write {
+                key,
+                bytes: vec![0x1b, b'[', b'A']
+            }]
+        );
+        assert_eq!(c.raw_enter(), b"\n");
+        c.action(Action::CycleLineEnding, now(3));
+        assert_eq!(c.raw_enter(), b"\r\n");
+        c.action(Action::CycleLineEnding, now(4));
+        assert_eq!(c.raw_enter(), b"\r");
+        let mut empty = core();
+        assert!(empty.action(Action::SendRaw(vec![b'x']), now(1)).is_empty());
+    }
+
+    #[test]
     fn rom_banner_mid_stream_inserts_reset_separator() {
         let mut c = core();
         let (key, conn) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
@@ -1184,6 +1284,23 @@ mod tests {
         assert_eq!(v.iter().filter(|l| l.contains("reset")).count(), 1);
         assert!(v[13].starts_with("──── reset · "), "{v:?}");
         assert_eq!(v[14], "ESP-ROM:esp32s3-20210327");
+    }
+
+    #[test]
+    fn set_format_applies_persists_and_is_used_on_open() {
+        let mut c = core();
+        let (key, _) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        let f = SerialFormat::new(7, crate::store::Parity::Even, 2);
+        let cmds = c.action(Action::SetFormat(f), now(2));
+        assert!(matches!(
+            &cmds[0],
+            Command::SetFormat { key: k, format } if *k == key && *format == f
+        ));
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::Persist { prefs, .. } if prefs.format == f))
+        );
+        assert_eq!(c.tabs()[0].format, f);
     }
 
     #[test]
@@ -1232,6 +1349,7 @@ mod tests {
             BoardPrefs {
                 baud: 9600,
                 line_ending: LineEnding::CrLf,
+                format: Default::default(),
             },
         );
         let mut c = Core::new(prefs, 115_200, vec![]);

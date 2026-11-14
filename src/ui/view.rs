@@ -12,6 +12,8 @@ pub enum Mode {
     #[default]
     Log,
     Send,
+    /// Every key goes straight to the board; `Ctrl-]` leaves.
+    Raw,
     Search,
     BaudPicker,
     OtherPorts,
@@ -24,10 +26,16 @@ pub struct View {
     pub history: Vec<String>,
     pub hist_idx: Option<usize>,
     pub search: String,
+    /// Show only the lines that match `search`.
+    pub filter: bool,
+    /// Newest matches left out of the filtered view (scrolled back).
+    pub filter_skip: usize,
     /// Where `/` was pressed: (buffer position, was following).
     pub search_origin: Option<(usize, bool)>,
     pub timestamps: bool,
     pub wrap: bool,
+    /// Mouse capture is on (off lets the terminal select text).
+    pub mouse: bool,
     pub picker_idx: usize,
     pub custom_baud: String,
     pub status_msg: Option<(String, Instant)>,
@@ -47,9 +55,12 @@ impl Default for View {
             history: Vec::new(),
             hist_idx: None,
             search: String::new(),
+            filter: false,
+            filter_skip: 0,
             search_origin: None,
             timestamps: true,
             wrap: true,
+            mouse: true,
             picker_idx: 0,
             custom_baud: String::new(),
             status_msg: None,
@@ -61,6 +72,10 @@ impl Default for View {
 }
 
 impl View {
+    /// The filtered view is on and has something to filter by.
+    pub fn filtering(&self) -> bool {
+        self.filter && !self.search.is_empty()
+    }
     pub fn new() -> Self {
         Self::default()
     }
