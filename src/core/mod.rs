@@ -17,6 +17,8 @@ use crate::store::{BoardPrefs, LineEnding};
 use pause::PauseTracker;
 
 const SCROLLBACK_CAP: usize = 100_000;
+/// Key prefix of `--port` tabs.
+const MANUAL_PREFIX: &str = "manual:";
 const BANNER_QUIET: u8 = 8;
 /// First reconnect retry after a lost connection; doubles per failure.
 const RETRY_FIRST: Duration = Duration::from_secs(1);
@@ -240,7 +242,7 @@ impl Core {
     pub fn startup(&mut self, now: Now) -> Vec<Command> {
         let mut cmds = Vec::new();
         for path in self.manual_ports.clone() {
-            let key = BoardKey(format!("manual:{}", path.display()));
+            let key = BoardKey(format!("{MANUAL_PREFIX}{}", path.display()));
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -551,10 +553,11 @@ impl Core {
                 self.other.push(dev.clone());
                 // A port connected with `c` behaves like any board (spec
                 // §6.1): its replug reattaches to the same tab.
-                if self.suppressed.contains(&key) || self.owned_by_other(&key, &dev.devnode) {
+                if self.suppressed.contains(&key) {
                     return;
                 }
-                if let Some(idx) = self.tabs.iter().position(|t| t.key == key) {
+                let owner = self.owner_of(&key, &dev.devnode);
+                if let Some(idx) = owner.or_else(|| self.tabs.iter().position(|t| t.key == key)) {
                     self.attach(idx, dev.devnode, now, cmds);
                 }
             }
@@ -565,8 +568,10 @@ impl Core {
                 if self.suppressed.contains(&key) {
                     return;
                 }
-                // A tab (e.g. a --port one) already owns this node.
-                if self.owned_by_other(&key, &dev.devnode) {
+                // A tab (e.g. a --port one) already owns this node: the
+                // device is that tab's (re)appearing port.
+                if let Some(idx) = self.owner_of(&key, &dev.devnode) {
+                    self.attach(idx, dev.devnode, now, cmds);
                     return;
                 }
                 let tabs_before = self.tabs.len();
@@ -680,6 +685,17 @@ impl Core {
         };
         t.retry_at = None;
         t.await_unblock = false;
+        // A `--port` tab's node is the user's path: keep it, so the tab
+        // (not a new auto tab) gets the port back when it reappears.
+        if t.key.0.starts_with(MANUAL_PREFIX) {
+            if matches!(t.state, TabState::Connecting | TabState::Connected) {
+                Self::flush_partial(t);
+                t.state = TabState::Waiting;
+                t.conn = 0;
+                cmds.push(Command::Close { key: t.key.clone() });
+            }
+            return;
+        }
         match t.state {
             TabState::Connecting | TabState::Connected => {
                 Self::flush_partial(t);
@@ -697,11 +713,11 @@ impl Core {
         }
     }
 
-    /// Whether a tab with a different key already holds `devnode`.
-    fn owned_by_other(&self, key: &BoardKey, devnode: &PathBuf) -> bool {
+    /// The tab with a different key that holds `devnode`, if any.
+    fn owner_of(&self, key: &BoardKey, devnode: &PathBuf) -> Option<usize> {
         self.tabs
             .iter()
-            .any(|t| &t.key != key && t.devnode.as_ref() == Some(devnode))
+            .position(|t| &t.key != key && t.devnode.as_ref() == Some(devnode))
     }
 
     fn foreign_open(
@@ -2460,6 +2476,31 @@ mod tests {
         assert_eq!(o, vec![(o[0].0, PathBuf::from("/dev/ttyUSB0"))]);
         assert_eq!(c.tabs()[0].state, TabState::Connecting);
         assert_eq!(c.tabs()[1].state, TabState::Connected);
+    }
+
+    #[test]
+    fn port_flag_tab_reconnects_on_replug() {
+        let mut c = Core::new(HashMap::new(), 115_200, vec!["/dev/ttyUSB0".into()]);
+        let conn = opens(&c.startup(now(0)))[0].0;
+        let key = c.tabs()[0].key.clone();
+        c.handle(
+            Event::PortOpened {
+                key: key.clone(),
+                conn,
+            },
+            now(1),
+        );
+        let d = dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0");
+        assert!(opens(&c.handle(Event::DeviceAdded(d.clone()), now(2))).is_empty());
+        let cmds = removed(&mut c, "/dev/ttyUSB0", 3);
+        assert!(cmds.contains(&Command::Close { key: key.clone() }));
+        assert_eq!(c.tabs()[0].state, TabState::Waiting);
+        assert_eq!(c.tabs()[0].devnode, Some("/dev/ttyUSB0".into()));
+        let o = opens(&c.handle(Event::DeviceAdded(d), now(600)));
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].1, PathBuf::from("/dev/ttyUSB0"));
+        assert_eq!(c.tabs().len(), 1);
+        assert_eq!(c.tabs()[0].key, key);
     }
 
     #[test]
