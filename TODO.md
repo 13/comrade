@@ -6,7 +6,7 @@ Items are grouped by priority. Each item has a check that tells you when it is d
 
 - [ ] **Hardware check.** Run comrade against the FT232R + Arduino Pro Mini on a real `/dev/ttyUSB0`. The `ftdi_sio` module for the running kernel (7.3.4) is now installed, so this is no longer blocked. It needs the board to be plugged in. `v0.1.0` is tagged without any real-hardware test.
   Check: boot log on plug, `r` reset over DTR, baud picker, unplug/replug, `pio run -t upload` pause and resume. Then go through the "Hardware checklist" in the README for the other boards you own.
-- [ ] **Choose a license.** Set `license` in `Cargo.toml`, add the `LICENSE` file, drop `publish = false` and the `[licenses] private` ignore in `deny.toml`. The release workflow below depends on this.
+- [x] **Choose a license** (GPL-3.0-or-later). Set `license` in `Cargo.toml`, add the `LICENSE` file, drop `publish = false` and the `[licenses] private` ignore in `deny.toml`. The release workflow below depends on this.
   Check: `cargo deny check` passes with the private ignore removed.
 - [ ] **Dependabot PR.** Merge or close the `actions/checkout` 5.1.0 to 7.0.1 bump (CI on it is green).
   Check: no open dependabot PR.

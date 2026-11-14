@@ -1,7 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
+- comrade is licensed under GPL-3.0-or-later.
 - Raw mode (`I`): every key goes straight to the board; `Ctrl-]` leaves.
 - `y` copies the bottom visible line with OSC 52. `m` turns mouse capture on or off.
 - A note in the log when the output does not look like text (wrong baud rate).

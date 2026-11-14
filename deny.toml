@@ -10,8 +10,6 @@ allow = [
   "Zlib",
   "MPL-2.0",
 ]
-# comrade itself has no license field yet (publish = false); only check deps.
-private = { ignore = true }
 
 [bans]
 multiple-versions = "warn"

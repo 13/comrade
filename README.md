@@ -12,6 +12,10 @@ Plug in an Arduino, ESP32, RP2040 or similar board and its output appears on scr
 
 Linux only. comrade needs udev, inotify and `/proc`.
 
+## License
+
+GPL-3.0-or-later. See `LICENSE`.
+
 ## Install
 
 ```sh
