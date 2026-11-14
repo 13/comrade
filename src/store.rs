@@ -131,8 +131,8 @@ mod tests {
 
     #[test]
     fn state_path_ends_with_comrade_boards() {
-        if let Some(p) = state_path() {
-            assert!(p.ends_with("comrade/boards.toml"), "{p:?}");
-        }
+        let p = state_path().expect("state dir resolvable (HOME set)");
+        assert!(p.ends_with("comrade/boards.toml"), "{p:?}");
+        assert!(p.is_absolute(), "{p:?}");
     }
 }

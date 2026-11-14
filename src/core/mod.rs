@@ -54,6 +54,9 @@ pub struct Tab {
     /// Node a foreign holder had open when this tab entered `Paused(Upload)`.
     /// Kept after the node vanishes so the holder's release can be matched.
     upload_node: Option<PathBuf>,
+    /// Set when an upload pause begins: the next `PortOpened` adds no
+    /// `reconnected` separator (the `upload` one already marks the gap).
+    after_upload: bool,
 }
 
 pub enum Action {
@@ -155,7 +158,10 @@ impl Core {
                     continue;
                 };
                 let key = board_key(&dev);
-                if self.suppressed.contains(&key) || self.owned_by_other(&key, &dev.devnode) {
+                if self.suppressed.contains(&key)
+                    || self.owned_by_other(&key, &dev.devnode)
+                    || self.pause.is_held(&dev.devnode)
+                {
                     continue;
                 }
                 let idx = self.find_or_create(key, friendly_name(&dev), family, now);
@@ -195,7 +201,10 @@ impl Core {
                 if let Some(i) = self.matching(&key, conn) {
                     let t = &mut self.tabs[i];
                     t.state = TabState::Connected;
-                    if t.ever_connected {
+                    if t.after_upload {
+                        t.after_upload = false;
+                        t.banner_quiet = BANNER_QUIET;
+                    } else if t.ever_connected {
                         t.scroll.push(separator(now, "reconnected"));
                         t.banner_quiet = BANNER_QUIET;
                     }
@@ -389,6 +398,7 @@ impl Core {
             data_this_conn: false,
             banner_quiet: 0,
             upload_node: None,
+            after_upload: false,
         });
         let idx = self.tabs.len() - 1;
         if self.tabs.len() > 1 && focused_connected {
@@ -439,21 +449,23 @@ impl Core {
                 }
                 let idx = self.find_or_create(key, friendly_name(&dev), family, now);
                 let held = self.pause.is_held(&dev.devnode);
+                let can_open = !held && self.pause.allows_auto_connect(now.mono);
                 let t = &mut self.tabs[idx];
                 let same_node = t.devnode.as_ref() == Some(&dev.devnode);
-                t.devnode = Some(dev.devnode.clone());
                 match t.state {
                     TabState::Connecting | TabState::Connected if same_node => {}
-                    TabState::Paused(PauseReason::Manual) => {}
-                    TabState::Paused(PauseReason::Upload(_)) if held => {}
-                    _ if self.pause.allows_auto_connect(now.mono) => {
-                        self.open_tab(idx, Some(dev.devnode), cmds);
+                    TabState::Paused(PauseReason::Manual) => t.devnode = Some(dev.devnode),
+                    TabState::Paused(PauseReason::Upload(_)) if held => {
+                        t.devnode = Some(dev.devnode)
                     }
+                    _ if can_open => self.open_tab(idx, Some(dev.devnode), cmds),
+                    // Live on another node; leave it alone while blocked.
+                    TabState::Connecting | TabState::Connected => {}
                     // Blocked: wait for `on_timer` to open it.
-                    TabState::Paused(PauseReason::Upload(_)) | TabState::Error(_) => {
+                    _ => {
+                        t.devnode = Some(dev.devnode);
                         t.state = TabState::Waiting;
                     }
-                    _ => {}
                 }
             }
         }
@@ -519,6 +531,7 @@ impl Core {
                 t.conn = 0;
                 cmds.push(Command::Close { key: t.key.clone() });
                 t.scroll.push(separator(now, "upload"));
+                t.after_upload = true;
             }
             _ => {}
         }
@@ -539,11 +552,15 @@ impl Core {
                 continue;
             }
             t.upload_node = None;
-            if t.devnode.as_ref() == Some(&devnode) {
+            let instant = matches!(t.family, Family::UartBridge | Family::EspUsbJtag);
+            if instant && t.devnode.as_ref() == Some(&devnode) {
                 // Same node still present: reopen at once to catch the boot log.
                 self.open_tab(idx, None, cmds);
             } else {
-                // Node vanished (re-enumeration, failed upload, unplug).
+                // NativeCdc/Unknown: an immediate reopen (DTR high, new line
+                // coding) would cancel a 1200-baud bootloader touch, so these
+                // wait for the quiet period and `on_timer` (devnode kept).
+                // Also: node vanished (re-enumeration, failed upload, unplug).
                 t.state = TabState::Waiting;
             }
         }
@@ -1533,5 +1550,131 @@ mod tests {
         let cmds = c.on_timer(now(502));
         assert!(opens(&cmds).is_empty());
         assert!(c.tabs().is_empty());
+    }
+
+    // ---- Task 5 review fixes ----
+
+    #[test]
+    fn native_cdc_1200_touch_not_cancelled() {
+        let mut c = core();
+        connect(&mut c, dev(0x2341, 0x8036, "L", "/dev/ttyACM0"));
+        // 1200-baud touch: open + close while the node is still present.
+        foreign_open(&mut c, "/dev/ttyACM0", esptool(), 10);
+        let cmds = foreign_released(&mut c, "/dev/ttyACM0", 15);
+        assert!(opens(&cmds).is_empty());
+        assert_eq!(c.tabs()[0].state, TabState::Waiting);
+        assert_eq!(c.tabs()[0].devnode, Some("/dev/ttyACM0".into()));
+        // Board resets into the bootloader.
+        assert!(opens(&removed(&mut c, "/dev/ttyACM0", 200)).is_empty());
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x2341, 0x0036, "L", "/dev/ttyACM1")),
+            now(300),
+        );
+        assert!(opens(&cmds).is_empty());
+        // avrdude flashes the bootloader node.
+        assert!(opens(&foreign_open(&mut c, "/dev/ttyACM1", esptool(), 400)).is_empty());
+        assert!(opens(&foreign_released(&mut c, "/dev/ttyACM1", 3000)).is_empty());
+        assert!(opens(&removed(&mut c, "/dev/ttyACM1", 3100)).is_empty());
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x2341, 0x8036, "L", "/dev/ttyACM0")),
+            now(3200),
+        );
+        assert!(opens(&cmds).is_empty());
+        assert_eq!(c.next_deadline(), Some(now(3500).mono));
+        assert!(opens(&c.on_timer(now(3499))).is_empty());
+        let o = opens(&c.on_timer(now(3500)));
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].1, PathBuf::from("/dev/ttyACM0"));
+        assert_eq!(c.tabs().len(), 1);
+    }
+
+    #[test]
+    fn native_cdc_release_reopens_after_quiet_if_node_stays() {
+        let mut c = core();
+        connect(&mut c, dev(0x2341, 0x8036, "L", "/dev/ttyACM0"));
+        foreign_open(&mut c, "/dev/ttyACM0", esptool(), 10);
+        foreign_released(&mut c, "/dev/ttyACM0", 20);
+        let o = opens(&c.on_timer(now(520)));
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].1, PathBuf::from("/dev/ttyACM0"));
+    }
+
+    #[test]
+    fn uart_bridge_same_flow_reopens_immediately() {
+        let mut c = core();
+        connect(&mut c, dev(0x1a86, 0x7523, "U", "/dev/ttyUSB0"));
+        foreign_open(&mut c, "/dev/ttyUSB0", esptool(), 10);
+        let o = opens(&foreign_released(&mut c, "/dev/ttyUSB0", 15));
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].1, PathBuf::from("/dev/ttyUSB0"));
+    }
+
+    #[test]
+    fn esp_usb_jtag_reopens_immediately() {
+        let mut c = core();
+        connect(&mut c, dev(0x303a, 0x1001, "S", "/dev/ttyACM0"));
+        foreign_open(&mut c, "/dev/ttyACM0", esptool(), 10);
+        assert_eq!(
+            opens(&foreign_released(&mut c, "/dev/ttyACM0", 15)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn upload_flow_has_single_upload_separator() {
+        let mut c = core();
+        let (key, conn) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        data(&mut c, &key, conn, b"app log\r\n");
+        foreign_open(&mut c, "/dev/ttyUSB0", esptool(), 10);
+        let conn = opens(&foreign_released(&mut c, "/dev/ttyUSB0", 15))[0].0;
+        c.handle(
+            Event::PortOpened {
+                key: key.clone(),
+                conn,
+            },
+            now(16),
+        );
+        data(&mut c, &key, conn, b"x\r\n");
+        data(&mut c, &key, conn, S3);
+        assert_eq!(seps(&c, "upload"), 1);
+        assert_eq!(seps(&c, "reconnected"), 0);
+        assert_eq!(seps(&c, "reset"), 0);
+        // A later ordinary reconnect still gets its separator.
+        removed(&mut c, "/dev/ttyUSB0", 100);
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0")),
+            now(1000),
+        );
+        let conn = opens(&cmds)[0].0;
+        c.handle(Event::PortOpened { key, conn }, now(1001));
+        assert_eq!(seps(&c, "reconnected"), 1);
+    }
+
+    #[test]
+    fn held_node_never_opened_by_device_added_or_timer() {
+        let mut c = core();
+        // Safety net lifts the global block, but the held node stays untouched.
+        foreign_open(&mut c, "/dev/ttyUSB0", Holder::Unknown, 0);
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0")),
+            now(60_000),
+        );
+        assert!(opens(&cmds).is_empty());
+        assert!(opens(&c.on_timer(now(60_001))).is_empty());
+        assert_eq!(c.tabs()[0].devnode, Some("/dev/ttyUSB0".into()));
+    }
+
+    #[test]
+    fn blocked_device_added_keeps_connected_devnode() {
+        let mut c = core();
+        connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        foreign_open(&mut c, "/dev/ttyACM5", Holder::Unknown, 2);
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x10c4, 0xea60, "A", "/dev/ttyUSB1")),
+            now(3),
+        );
+        assert!(opens(&cmds).is_empty());
+        assert_eq!(c.tabs()[0].devnode, Some("/dev/ttyUSB0".into()));
+        assert_eq!(c.tabs()[0].state, TabState::Connected);
     }
 }
