@@ -392,4 +392,51 @@ mod tests {
         assert_eq!(a.flush().unwrap().text, "abc");
         assert!(a.flush().is_none());
     }
+
+    /// Splitting the input into reads anywhere must not change the lines:
+    /// ANSI escapes, multi-byte UTF-8, lone `\r` and `\r\n` can all straddle reads.
+    #[test]
+    fn chunking_does_not_change_the_lines() {
+        let at = Local.timestamp_opt(0, 0).unwrap();
+        let pieces: [&[u8]; 12] = [
+            b"abc",
+            b"\n",
+            b"\r",
+            b"\r\n",
+            "h\u{e9}llo \u{2713} \u{1f980}".as_bytes(),
+            b"\x1b[31m",
+            b"\x1b[0m",
+            b"\x1b[2K",
+            b"\x1b[1;32mgreen",
+            &[0xe2, 0x9c],
+            &[0xff, 0x00, 0x07],
+            b"\t",
+        ];
+        let mut x: u32 = 99;
+        let mut next = |n: usize| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x >> 16) as usize % n
+        };
+        for _ in 0..300 {
+            let mut input = Vec::new();
+            for _ in 0..next(25) + 1 {
+                input.extend_from_slice(pieces[next(pieces.len())]);
+            }
+            let run = |chunk: usize| {
+                let mut a = LineAssembler::new();
+                let mut out: Vec<(LineKind, String)> = Vec::new();
+                for c in input.chunks(chunk) {
+                    for l in a.push(c, at).complete {
+                        out.push((l.kind, l.text));
+                    }
+                }
+                let tail = a.flush().map(|l| (l.kind, l.text));
+                (out, tail)
+            };
+            let whole = run(input.len().max(1));
+            for chunk in [1, 2, 3, 5, 7] {
+                assert_eq!(run(chunk), whole, "chunk {chunk}, input {input:?}");
+            }
+        }
+    }
 }

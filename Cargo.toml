@@ -1,16 +1,17 @@
 [package]
 name = "comrade"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
-# No license chosen yet; keeps the crate off crates.io and out of cargo-deny's license check.
-publish = false
+license = "GPL-3.0-or-later"
 
 [dependencies]
 ansi-to-tui = "8.0.1"
 anyhow = "1.0.104"
 chrono = "0.4.45"
 clap = { version = "4.6.7", features = ["derive"] }
+clap_complete = "4.6.11"
+clap_mangen = "0.3.3"
 crossbeam-channel = "0.5.17"
 crossterm = "0.29.0"
 directories = "6.0.0"
