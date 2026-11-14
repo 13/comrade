@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::board::{
-    BoardKey, Class, DeviceInfo, Family, LinePolicy, board_key, classify, friendly_name,
-    line_policy,
+    BoardKey, Class, DeviceInfo, Family, LinePolicy, board_key, board_key_at_path, classify,
+    friendly_name, line_policy,
 };
 use crate::event::{Command, ConnId, Event, Holder, Now, OpenError};
 use crate::lines::{Line, LineAssembler, LineKind};
@@ -82,6 +82,8 @@ pub struct Core {
     manual_ports: Vec<PathBuf>,
     /// Present Auto-class devices (including ones without a tab).
     present_auto: Vec<DeviceInfo>,
+    /// Key each present Auto device was given (see `auto_key`).
+    auto_keys: HashMap<PathBuf, BoardKey>,
     /// Present Other and Bootloader devices.
     other: Vec<DeviceInfo>,
     suppressed: HashSet<BoardKey>,
@@ -124,6 +126,7 @@ impl Core {
             prefs,
             manual_ports,
             present_auto: Vec::new(),
+            auto_keys: HashMap::new(),
             other: Vec::new(),
             suppressed: HashSet::new(),
             next_conn: 1,
@@ -163,7 +166,7 @@ impl Core {
                 let Class::Auto(family) = classify(dev.vid, dev.pid) else {
                     continue;
                 };
-                let key = board_key(&dev);
+                let key = self.key_of(&dev);
                 if self.suppressed.contains(&key)
                     || self.owned_by_other(&key, &dev.devnode)
                     || self.pause.is_held(&dev.devnode)
@@ -452,12 +455,26 @@ impl Core {
 
     fn device_added(&mut self, dev: DeviceInfo, now: Now, cmds: &mut Vec<Command>) {
         self.present_auto.retain(|d| d.devnode != dev.devnode);
+        self.auto_keys.remove(&dev.devnode);
         self.other.retain(|d| d.devnode != dev.devnode);
         match classify(dev.vid, dev.pid) {
-            Class::Other | Class::Bootloader => self.other.push(dev),
-            Class::Auto(family) => {
+            Class::Bootloader => self.other.push(dev),
+            Class::Other => {
                 let key = board_key(&dev);
+                self.other.push(dev.clone());
+                // A port connected with `c` behaves like any board (spec
+                // §6.1): its replug reattaches to the same tab.
+                if self.suppressed.contains(&key) || self.owned_by_other(&key, &dev.devnode) {
+                    return;
+                }
+                if let Some(idx) = self.tabs.iter().position(|t| t.key == key) {
+                    self.attach(idx, dev.devnode, now, cmds);
+                }
+            }
+            Class::Auto(family) => {
+                let key = self.auto_key(&dev);
                 self.present_auto.push(dev.clone());
+                self.auto_keys.insert(dev.devnode.clone(), key.clone());
                 if self.suppressed.contains(&key) {
                     return;
                 }
@@ -466,35 +483,74 @@ impl Core {
                     return;
                 }
                 let idx = self.find_or_create(key, friendly_name(&dev), family, now);
-                let held = self.pause.is_held(&dev.devnode);
-                let can_open = !held && self.pause.allows_auto_connect(now.mono);
-                let t = &mut self.tabs[idx];
-                let same_node = t.devnode.as_ref() == Some(&dev.devnode);
-                match t.state {
-                    TabState::Connecting | TabState::Connected if same_node => {}
-                    TabState::Paused(PauseReason::Manual) => t.devnode = Some(dev.devnode),
-                    TabState::Paused(PauseReason::Upload(_)) if held => {
-                        t.devnode = Some(dev.devnode)
-                    }
-                    _ if can_open => self.open_tab(idx, Some(dev.devnode), cmds),
-                    // Live on another node; leave it alone while blocked.
-                    TabState::Connecting | TabState::Connected => {}
-                    // Blocked: wait for `on_timer` to open it.
-                    _ => {
-                        t.devnode = Some(dev.devnode);
-                        t.state = TabState::Waiting;
-                    }
-                }
+                self.attach(idx, dev.devnode, now, cmds);
             }
         }
     }
 
+    /// Points tab `idx` at the (re)appeared `devnode` and opens it when the
+    /// pause rules allow; otherwise it waits for `on_timer`.
+    fn attach(&mut self, idx: usize, devnode: PathBuf, now: Now, cmds: &mut Vec<Command>) {
+        let held = self.pause.is_held(&devnode);
+        let can_open = !held && self.pause.allows_auto_connect(now.mono);
+        let t = &mut self.tabs[idx];
+        let same_node = t.devnode.as_ref() == Some(&devnode);
+        match t.state {
+            TabState::Connecting | TabState::Connected if same_node => {}
+            TabState::Paused(PauseReason::Manual) => t.devnode = Some(devnode),
+            TabState::Paused(PauseReason::Upload(_)) if held => t.devnode = Some(devnode),
+            _ if can_open => self.open_tab(idx, Some(devnode), cmds),
+            // Live on another node; leave it alone while blocked.
+            TabState::Connecting | TabState::Connected => {}
+            // Blocked: wait for `on_timer` to open it.
+            _ => {
+                t.devnode = Some(devnode);
+                t.state = TabState::Waiting;
+            }
+        }
+    }
+
+    /// Key for a new Auto device. Normally `board_key`; but when that key's
+    /// tab is live on a different node that is still present, this is a
+    /// second board with the same USB serial (many CP2102 clones report
+    /// `0001`), so it gets its own key with the port path appended.
+    fn auto_key(&self, dev: &DeviceInfo) -> BoardKey {
+        let key = board_key(dev);
+        let taken = self.tabs.iter().any(|t| {
+            t.key == key
+                && matches!(
+                    t.state,
+                    TabState::Connecting
+                        | TabState::Connected
+                        | TabState::Paused(PauseReason::Upload(_))
+                )
+                && t.devnode.as_ref().is_some_and(|n| {
+                    n != &dev.devnode && self.present_auto.iter().any(|d| &d.devnode == n)
+                })
+        });
+        if taken { board_key_at_path(dev) } else { key }
+    }
+
+    /// Key a present device is known under.
+    fn key_of(&self, dev: &DeviceInfo) -> BoardKey {
+        self.auto_keys
+            .get(&dev.devnode)
+            .cloned()
+            .unwrap_or_else(|| board_key(dev))
+    }
+
     fn device_removed(&mut self, devnode: PathBuf, cmds: &mut Vec<Command>) {
-        if let Some(d) = self.present_auto.iter().find(|d| d.devnode == devnode) {
-            let key = board_key(d);
+        if let Some(d) = self
+            .present_auto
+            .iter()
+            .chain(self.other.iter())
+            .find(|d| d.devnode == devnode)
+        {
+            let key = self.key_of(d);
             self.suppressed.remove(&key);
         }
         self.present_auto.retain(|d| d.devnode != devnode);
+        self.auto_keys.remove(&devnode);
         self.other.retain(|d| d.devnode != devnode);
         let Some(t) = self
             .tabs
@@ -1724,6 +1780,95 @@ mod tests {
         assert!(opens(&cmds).is_empty());
         assert!(opens(&c.on_timer(now(60_001))).is_empty());
         assert_eq!(c.tabs()[0].devnode, Some("/dev/ttyUSB0".into()));
+    }
+
+    // ---- final fix wave ----
+
+    #[test]
+    fn connect_other_tab_reattaches_on_replug() {
+        let mut c = core();
+        let phone = dev(0x04e8, 0x6860, "P", "/dev/ttyACM0");
+        c.handle(Event::DeviceAdded(phone.clone()), now(0));
+        let o = opens(&c.action(Action::ConnectOther("/dev/ttyACM0".into()), now(1)));
+        let key = c.tabs()[0].key.clone();
+        c.handle(
+            Event::PortOpened {
+                key: key.clone(),
+                conn: o[0].0,
+            },
+            now(2),
+        );
+        let cmds = removed(&mut c, "/dev/ttyACM0", 3);
+        assert!(cmds.contains(&Command::Close { key: key.clone() }));
+        assert_eq!(c.tabs()[0].state, TabState::Waiting);
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x04e8, 0x6860, "P", "/dev/ttyACM1")),
+            now(4),
+        );
+        let o = opens(&cmds);
+        assert_eq!(o.len(), 1, "{cmds:?}");
+        assert_eq!(o[0].1, PathBuf::from("/dev/ttyACM1"));
+        assert_eq!(c.tabs().len(), 1);
+        assert_eq!(c.tabs()[0].key, key);
+        assert_eq!(c.tabs()[0].family, Family::Unknown);
+        assert_eq!(c.tabs()[0].state, TabState::Connecting);
+    }
+
+    #[test]
+    fn other_device_without_tab_is_not_opened() {
+        let mut c = core();
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x04e8, 0x6860, "P", "/dev/ttyACM0")),
+            now(0),
+        );
+        assert!(opens(&cmds).is_empty());
+        assert!(c.tabs().is_empty());
+    }
+
+    fn cp2102(serial: &str, id_path: &str, node: &str) -> DeviceInfo {
+        DeviceInfo {
+            id_path: Some(id_path.into()),
+            ..dev(0x10c4, 0xea60, serial, node)
+        }
+    }
+
+    #[test]
+    fn identical_serials_get_separate_tabs() {
+        let mut c = core();
+        let a = cp2102("0001", "pci-0000:00:14.0-usb-0:1:1.0", "/dev/ttyUSB0");
+        let b = cp2102("0001", "pci-0000:00:14.0-usb-0:2:1.0", "/dev/ttyUSB1");
+        let (ka, _) = connect(&mut c, a);
+        let cmds = c.handle(Event::DeviceAdded(b.clone()), now(2));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Command::Close { .. })),
+            "{cmds:?}"
+        );
+        let o = opens(&cmds);
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].1, PathBuf::from("/dev/ttyUSB1"));
+        assert_eq!(c.tabs().len(), 2);
+        assert_eq!(c.tabs()[0].key, ka);
+        assert_eq!(c.tabs()[0].state, TabState::Connected);
+        assert_eq!(c.tabs()[0].devnode, Some("/dev/ttyUSB0".into()));
+        assert_eq!(
+            c.tabs()[1].key,
+            BoardKey("10c4:ea60:0001@pci-0000:00:14.0-usb-0:2:1.0".into())
+        );
+        assert_eq!(c.tabs()[1].state, TabState::Connecting);
+        // The second board's replug comes back to its own tab.
+        removed(&mut c, "/dev/ttyUSB1", 3);
+        let o = opens(&c.handle(
+            Event::DeviceAdded(cp2102(
+                "0001",
+                "pci-0000:00:14.0-usb-0:2:1.0",
+                "/dev/ttyUSB2",
+            )),
+            now(4),
+        ));
+        assert_eq!(o.len(), 1);
+        assert_eq!(c.tabs().len(), 2);
+        assert_eq!(c.tabs()[1].devnode, Some("/dev/ttyUSB2".into()));
+        assert_eq!(c.tabs()[0].state, TabState::Connected);
     }
 
     #[test]

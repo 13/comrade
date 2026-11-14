@@ -94,6 +94,21 @@ pub fn board_key(d: &DeviceInfo) -> BoardKey {
     BoardKey(format!("{vid:04x}:{pid:04x}@{}", d.devnode.display()))
 }
 
+/// Key for a board whose plain `board_key` is already taken by another
+/// present board (clones sharing a USB serial such as `0001`): the serial
+/// key plus the physical USB port path (`ID_PATH`, else the devnode).
+pub fn board_key_at_path(d: &DeviceInfo) -> BoardKey {
+    let base = board_key(d).0;
+    if base.contains('@') {
+        return BoardKey(base); // already path-keyed
+    }
+    let at = match d.id_path.as_deref().filter(|p| !p.is_empty()) {
+        Some(p) => p.to_string(),
+        None => d.devnode.display().to_string(),
+    };
+    BoardKey(format!("{base}@{at}"))
+}
+
 pub fn friendly_name(d: &DeviceInfo) -> String {
     let known = match (d.vid, d.pid) {
         (0x303a, 0x1001) => Some("ESP32-S3/C3"),
@@ -250,6 +265,21 @@ mod tests {
         );
         assert_eq!(board_key(&a), board_key(&a2));
         assert_eq!(board_key(&a).0, "1a86:7523@pci-0000:00:14.0-usb-0:1:1.0");
+    }
+    #[test]
+    fn key_at_path_adds_port_path_to_serial_key() {
+        let d = dev(
+            0x10c4,
+            0xea60,
+            Some("0001"),
+            Some("pci-x-usb-0:2:1.0"),
+            "/dev/ttyUSB1",
+        );
+        assert_eq!(board_key_at_path(&d).0, "10c4:ea60:0001@pci-x-usb-0:2:1.0");
+        let d = dev(0x10c4, 0xea60, Some("0001"), None, "/dev/ttyUSB1");
+        assert_eq!(board_key_at_path(&d).0, "10c4:ea60:0001@/dev/ttyUSB1");
+        let d = dev(0x1a86, 0x7523, None, Some("p"), "/dev/ttyUSB0");
+        assert_eq!(board_key_at_path(&d), board_key(&d));
     }
     #[test]
     fn key_falls_back_to_devnode_and_ignores_empty_serial() {
