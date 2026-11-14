@@ -12,24 +12,31 @@
 //! and `/dev/ttyACM0` match. Events carry the devnode exactly as it was given
 //! to [`OpenerWatch::set_watched`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask, Watches};
 
 use crate::event::{Event, Holder};
 
-/// Re-scans when an IN_OPEN shows no visible holder and no own open is
-/// pending. The kernel queues IN_OPEN just before the opener's fd lands in
-/// its fd table, so a very fast scan can miss it.
+/// Re-scans when an IN_OPEN shows no visible holder. The kernel queues
+/// IN_OPEN just before the opener's fd lands in its fd table, so a very fast
+/// scan can miss it. Done even when an own open is pending: comrade's and an
+/// uploader's simultaneous opens can merge into one event.
 const OPEN_RESCANS: u32 = 3;
 const OPEN_RESCAN_GAP: Duration = Duration::from_millis(2);
+
+/// A noted own open/close that no inotify event consumed within this time is
+/// forgotten (the open failed, or its event was lost).
+pub const OWN_TTL: Duration = Duration::from_secs(1);
+
+const PROC: &str = "/proc";
 
 fn node_mask() -> WatchMask {
     WatchMask::OPEN
@@ -48,6 +55,25 @@ fn inode_of(path: &Path) -> Option<(u64, u64)> {
     std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
+/// Consumes one pending own operation noted within `OWN_TTL` before `now`.
+/// Older entries are dropped first. Returns whether one was consumed.
+pub fn take_pending(queue: &mut VecDeque<Instant>, now: Instant) -> bool {
+    while queue
+        .front()
+        .is_some_and(|t| now.saturating_duration_since(*t) > OWN_TTL)
+    {
+        queue.pop_front();
+    }
+    queue.pop_front().is_some()
+}
+
+/// Own opens/closes announced by the app but not yet seen as events.
+#[derive(Default)]
+struct OwnPending {
+    opens: VecDeque<Instant>,
+    closes: VecDeque<Instant>,
+}
+
 struct Node {
     /// The path as given to `set_watched`; events carry this one.
     original: PathBuf,
@@ -55,8 +81,12 @@ struct Node {
     /// Inode the watch sits on, to notice a node that was removed and
     /// recreated under the same name.
     inode: Option<(u64, u64)>,
-    /// `None` = no foreign holder.
+    /// `None` = no foreign holder. This is what Core was told.
     state: Option<Holder>,
+    /// Every foreign holder visible in /proc at the last check. On close
+    /// only these pids are re-checked.
+    holders: Vec<Holder>,
+    own: OwnPending,
 }
 
 struct Shared {
@@ -65,8 +95,6 @@ struct Shared {
     nodes: HashMap<PathBuf, Node>,
     /// watch descriptor -> canonical path
     by_wd: HashMap<WatchDescriptor, PathBuf>,
-    /// canonical path -> (pending own opens, pending own closes)
-    own: HashMap<PathBuf, (u32, u32)>,
     tx: Sender<Event>,
     /// Receiver gone or `OpenerWatch` dropped: the reader thread exits.
     closed: bool,
@@ -79,26 +107,6 @@ impl Shared {
         }
     }
 
-    fn take_own_open(&mut self, canon: &Path) -> bool {
-        match self.own.get_mut(canon) {
-            Some((opens, _)) if *opens > 0 => {
-                *opens -= 1;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn take_own_close(&mut self, canon: &Path) -> bool {
-        match self.own.get_mut(canon) {
-            Some((_, closes)) if *closes > 0 => {
-                *closes -= 1;
-                true
-            }
-            _ => false,
-        }
-    }
-
     /// Forget a node. Emits `ForeignReleased` if a foreign holder was known,
     /// so Core never keeps a stale holder.
     fn drop_node(&mut self, canon: &Path) {
@@ -106,7 +114,6 @@ impl Shared {
             return;
         };
         self.by_wd.remove(&node.wd);
-        self.own.remove(canon);
         // Fails harmlessly after IN_IGNORED: the kernel already removed it.
         let _ = self.watches.remove(node.wd);
         if node.state.is_some() {
@@ -116,29 +123,26 @@ impl Shared {
         }
     }
 
-    fn add_node(&mut self, canon: PathBuf, original: PathBuf) {
+    /// Starts watching with state free and no pending own operations.
+    /// Returns false if inotify refused the watch.
+    fn add_node(&mut self, canon: PathBuf, original: PathBuf) -> bool {
         let Ok(wd) = self.watches.add(&canon, node_mask()) else {
-            return;
+            return false;
         };
-        let state = foreign_holders(&canon, std::process::id())
-            .into_iter()
-            .next();
-        if let Some(holder) = &state {
-            self.send(Event::ForeignOpen {
-                devnode: original.clone(),
-                holder: holder.clone(),
-            });
-        }
         self.by_wd.insert(wd.clone(), canon.clone());
+        let inode = inode_of(&canon);
         self.nodes.insert(
-            canon.clone(),
+            canon,
             Node {
                 original,
                 wd,
-                inode: inode_of(&canon),
-                state,
+                inode,
+                state: None,
+                holders: Vec::new(),
+                own: OwnPending::default(),
             },
         );
+        true
     }
 }
 
@@ -160,7 +164,6 @@ impl OpenerWatch {
             watches: inotify.watches(),
             nodes: HashMap::new(),
             by_wd: HashMap::new(),
-            own: HashMap::new(),
             tx,
             closed: false,
         }));
@@ -172,8 +175,9 @@ impl OpenerWatch {
     }
 
     /// Replaces the watched set (`Command::Watch`). New nodes are scanned
-    /// right away; removed nodes that had a foreign holder get
-    /// `ForeignReleased`. Nodes that do not exist are skipped.
+    /// right away (one /proc pass, outside the lock); removed nodes that had
+    /// a foreign holder get `ForeignReleased`. Nodes that do not exist are
+    /// skipped.
     pub fn set_watched(&self, nodes: Vec<PathBuf>) {
         let mut wanted: HashMap<PathBuf, PathBuf> = HashMap::new();
         for original in nodes {
@@ -181,34 +185,87 @@ impl OpenerWatch {
                 wanted.insert(canon, original);
             }
         }
-        let mut s = lock(&self.shared);
-        let gone: Vec<PathBuf> = s
-            .nodes
-            .keys()
-            .filter(|c| !wanted.contains_key(*c))
-            .cloned()
-            .collect();
-        for canon in gone {
-            s.drop_node(&canon);
-        }
-        for (canon, original) in wanted {
-            match s.nodes.get_mut(&canon) {
-                Some(node) => node.original = original,
-                None => s.add_node(canon, original),
+        let mut added = HashSet::new();
+        {
+            let mut s = lock(&self.shared);
+            let gone: Vec<PathBuf> = s
+                .nodes
+                .keys()
+                .filter(|c| !wanted.contains_key(*c))
+                .cloned()
+                .collect();
+            for canon in gone {
+                s.drop_node(&canon);
+            }
+            for (canon, original) in wanted {
+                match s.nodes.get_mut(&canon) {
+                    Some(node) => node.original = original,
+                    None => {
+                        if s.add_node(canon.clone(), original) {
+                            added.insert(canon);
+                        }
+                    }
+                }
             }
         }
+        if added.is_empty() {
+            return;
+        }
+        // The watch is already live, so an open racing this scan is handled
+        // by the reader; whoever sets state first wins and the other stays
+        // silent.
+        let found = holders_in(Path::new(PROC), &added, std::process::id());
+        let mut s = lock(&self.shared);
+        for (canon, holders) in found {
+            let Some(node) = s.nodes.get_mut(&canon) else {
+                continue; // unwatched meanwhile
+            };
+            if node.state.is_some() {
+                continue;
+            }
+            // Re-check under the lock: a holder that closed after the scan
+            // has already had its IN_CLOSE handled against a free state.
+            let holders: Vec<Holder> = holders
+                .into_iter()
+                .filter(|h| still_holds(h, &canon))
+                .collect();
+            let Some(first) = holders.first().cloned() else {
+                continue;
+            };
+            node.holders = holders;
+            node.state = Some(first.clone());
+            let devnode = node.original.clone();
+            s.send(Event::ForeignOpen {
+                devnode,
+                holder: first,
+            });
+        }
     }
 
-    /// Call right before comrade opens `node` itself.
+    /// Call right before comrade opens `node` itself. No-op unless `node`
+    /// is watched.
     pub fn note_own_open(&self, node: &Path) {
         let canon = canonical(node);
-        lock(&self.shared).own.entry(canon).or_default().0 += 1;
+        if let Some(n) = lock(&self.shared).nodes.get_mut(&canon) {
+            n.own.opens.push_back(Instant::now());
+        }
     }
 
-    /// Call right before comrade closes its fd on `node`.
+    /// Call when an open announced with `note_own_open` failed.
+    pub fn cancel_own_open(&self, node: &Path) {
+        let canon = canonical(node);
+        if let Some(n) = lock(&self.shared).nodes.get_mut(&canon) {
+            n.own.opens.pop_back();
+        }
+    }
+
+    /// Call right before comrade closes its fd on `node`. No-op unless
+    /// `node` is watched.
     pub fn note_own_close(&self, node: &Path) {
         let canon = canonical(node);
-        lock(&self.shared).own.entry(canon).or_default().1 += 1;
+        if let Some(n) = lock(&self.shared).nodes.get_mut(&canon) {
+            n.own.closes.push_back(Instant::now());
+        }
     }
 }
 
@@ -280,25 +337,29 @@ fn handle(shared: &Mutex<Shared>, wd: &WatchDescriptor, mask: EventMask) {
     }
 }
 
+fn scan_one(canon: &Path) -> Vec<Holder> {
+    let targets = HashSet::from([canon.to_path_buf()]);
+    holders_in(Path::new(PROC), &targets, std::process::id())
+        .remove(canon)
+        .unwrap_or_default()
+}
+
 fn on_open(shared: &Mutex<Shared>, canon: &Path) {
-    let own_pending = lock(shared).own.get(canon).is_some_and(|c| c.0 > 0);
-    let me = std::process::id();
-    let mut named = foreign_holders(canon, me);
-    if named.is_empty() && !own_pending {
-        for _ in 0..OPEN_RESCANS {
-            thread::sleep(OPEN_RESCAN_GAP);
-            named = foreign_holders(canon, me);
-            if !named.is_empty() {
-                break;
-            }
+    let mut named = scan_one(canon);
+    for _ in 0..OPEN_RESCANS {
+        if !named.is_empty() {
+            break;
         }
+        thread::sleep(OPEN_RESCAN_GAP);
+        named = scan_one(canon);
     }
     let mut s = lock(shared);
-    let own = s.take_own_open(canon);
     let Some(node) = s.nodes.get_mut(canon) else {
         return;
     };
+    let own = take_pending(&mut node.own.opens, Instant::now());
     let was_free = node.state.is_none();
+    node.holders.clone_from(&named);
     let holder = match named.into_iter().next() {
         Some(h) => h,
         None if !own => Holder::Unknown,
@@ -312,26 +373,51 @@ fn on_open(shared: &Mutex<Shared>, canon: &Path) {
 }
 
 fn on_close(shared: &Mutex<Shared>, canon: &Path) {
-    let own = lock(shared).take_own_close(canon);
-    let named = foreign_holders(canon, std::process::id());
+    let (own, recorded, named_state) = {
+        let mut s = lock(shared);
+        let Some(node) = s.nodes.get_mut(canon) else {
+            return;
+        };
+        let own = take_pending(&mut node.own.closes, Instant::now());
+        let named_state = matches!(node.state, Some(Holder::Named { .. }));
+        (own, node.holders.clone(), named_state)
+    };
+    // Fast path: only the pids we know about. A gone pid counts as released.
+    let mut named: Vec<Holder> = recorded
+        .into_iter()
+        .filter(|h| still_holds(h, canon))
+        .collect();
+    if named.is_empty() && named_state {
+        // Catch a holder we never recorded (e.g. its open merged with another).
+        named = scan_one(canon);
+    }
     let mut s = lock(shared);
     let Some(node) = s.nodes.get_mut(canon) else {
         return;
     };
+    node.holders.clone_from(&named);
     if node.state.is_some() && named.is_empty() && (!own || node.state != Some(Holder::Unknown)) {
         node.state = None;
         let devnode = node.original.clone();
         s.send(Event::ForeignReleased { devnode });
+    } else if let (Some(Holder::Named { .. }), Some(first)) = (&node.state, named.first()) {
+        // The reported holder left but another remains: keep the label
+        // accurate without telling Core again.
+        node.state = Some(first.clone());
     }
 }
 
-/// Events were lost (queue overflow): reconcile every node with /proc.
+/// Events were lost (queue overflow): reconcile every node with one /proc
+/// pass and forget pending own operations, whose events may be gone.
 /// Unknown holders are left alone since the scan cannot see them.
 fn resync(s: &mut Shared) {
-    let me = std::process::id();
+    let targets: HashSet<PathBuf> = s.nodes.keys().cloned().collect();
+    let mut found = holders_in(Path::new(PROC), &targets, std::process::id());
     let mut out = Vec::new();
     for (canon, node) in s.nodes.iter_mut() {
-        let named = foreign_holders(canon, me);
+        node.own = OwnPending::default();
+        let named = found.remove(canon).unwrap_or_default();
+        node.holders.clone_from(&named);
         match (named.into_iter().next(), &node.state) {
             (Some(holder), None) => {
                 node.state = Some(holder.clone());
@@ -355,15 +441,38 @@ fn resync(s: &mut Shared) {
     }
 }
 
-/// Processes other than `own_pid` that hold `node` open, found by following
-/// `/proc/<pid>/fd/*` links. Processes whose fd dir is unreadable (other
-/// users, root) are skipped.
-pub fn foreign_holders(node: &Path, own_pid: u32) -> Vec<Holder> {
-    let target = canonical(node);
-    let Ok(procs) = std::fs::read_dir("/proc") else {
-        return Vec::new();
+/// Whether a recorded holder still has `canon` open. Reads only that pid's
+/// fd dir. An exited (or now unreadable) pid counts as released.
+fn still_holds(holder: &Holder, canon: &Path) -> bool {
+    let Holder::Named { pid, .. } = holder else {
+        return false;
     };
-    let mut out = Vec::new();
+    let Ok(fds) = std::fs::read_dir(Path::new(PROC).join(pid.to_string()).join("fd")) else {
+        return false;
+    };
+    fds.flatten()
+        .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| l == canon))
+}
+
+/// One pass over `<proc_root>/<pid>/fd/*` matching every link against
+/// `targets` (canonical paths). Returns the holders per target that has
+/// any, in pid order of the directory listing.
+///
+/// Skipped: `own_pid`, non-numeric entries, processes whose fd dir is
+/// unreadable (other users, root), and processes whose `comm` is unreadable
+/// or empty (they exited mid-scan).
+pub fn holders_in(
+    proc_root: &Path,
+    targets: &HashSet<PathBuf>,
+    own_pid: u32,
+) -> HashMap<PathBuf, Vec<Holder>> {
+    let mut out: HashMap<PathBuf, Vec<Holder>> = HashMap::new();
+    if targets.is_empty() {
+        return out;
+    }
+    let Ok(procs) = std::fs::read_dir(proc_root) else {
+        return out;
+    };
     for entry in procs.flatten() {
         let Some(pid) = entry
             .file_name()
@@ -378,16 +487,130 @@ pub fn foreign_holders(node: &Path, own_pid: u32) -> Vec<Holder> {
         let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
             continue;
         };
-        let holds = fds
-            .flatten()
-            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| l == target));
-        if holds {
-            let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
-            out.push(Holder::Named {
+        let mut held: Vec<PathBuf> = Vec::new();
+        for fd in fds.flatten() {
+            if let Ok(link) = std::fs::read_link(fd.path())
+                && targets.contains(&link)
+                && !held.contains(&link)
+            {
+                held.push(link);
+            }
+        }
+        if held.is_empty() {
+            continue;
+        }
+        let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+        let comm = comm.trim();
+        if comm.is_empty() {
+            continue;
+        }
+        for target in held {
+            out.entry(target).or_default().push(Holder::Named {
                 pid,
-                comm: comm.trim().to_string(),
+                comm: comm.to_string(),
             });
         }
     }
     out
+}
+
+/// Processes other than `own_pid` that hold `node` open (see
+/// [`holders_in`]).
+pub fn foreign_holders(node: &Path, own_pid: u32) -> Vec<Holder> {
+    let target = canonical(node);
+    let targets = HashSet::from([target.clone()]);
+    holders_in(Path::new(PROC), &targets, own_pid)
+        .remove(&target)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn take_pending_consumes_fresh_entry() {
+        let now = Instant::now();
+        let mut q = VecDeque::from([now]);
+        assert!(take_pending(&mut q, now + Duration::from_millis(500)));
+        assert!(q.is_empty());
+        assert!(!take_pending(&mut q, now));
+    }
+
+    #[test]
+    fn take_pending_drops_expired_entries() {
+        let t0 = Instant::now();
+        let mut q = VecDeque::from([t0, t0 + Duration::from_millis(100)]);
+        // both older than OWN_TTL
+        assert!(!take_pending(&mut q, t0 + Duration::from_millis(1200)));
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn take_pending_skips_expired_but_takes_fresh() {
+        let t0 = Instant::now();
+        let fresh = t0 + Duration::from_millis(900);
+        let mut q = VecDeque::from([t0, fresh, fresh]);
+        assert!(take_pending(&mut q, t0 + Duration::from_millis(1500)));
+        assert_eq!(q, VecDeque::from([fresh]));
+    }
+
+    #[test]
+    fn take_pending_at_exact_ttl_still_counts() {
+        let t0 = Instant::now();
+        let mut q = VecDeque::from([t0]);
+        assert!(take_pending(&mut q, t0 + OWN_TTL));
+    }
+
+    fn proc_entry(root: &Path, pid: &str, comm: Option<&str>, links: &[&Path]) {
+        let fd = root.join(pid).join("fd");
+        std::fs::create_dir_all(&fd).unwrap();
+        for (i, l) in links.iter().enumerate() {
+            symlink(l, fd.join(i.to_string())).unwrap();
+        }
+        if let Some(c) = comm {
+            std::fs::write(root.join(pid).join("comm"), c).unwrap();
+        }
+    }
+
+    #[test]
+    fn holders_in_matches_many_targets_in_one_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let acm0 = Path::new("/dev/ttyACM0");
+        let usb0 = Path::new("/dev/ttyUSB0");
+        let other = Path::new("/dev/null");
+        proc_entry(root, "100", Some("esptool\n"), &[other, acm0, acm0]);
+        proc_entry(root, "200", Some("avrdude\n"), &[usb0, acm0]);
+        proc_entry(root, "300", None, &[acm0]); // exited mid-scan: no comm
+        proc_entry(root, "301", Some("\n"), &[acm0]); // empty comm
+        proc_entry(root, "400", Some("comrade\n"), &[acm0]); // own pid
+        proc_entry(root, "500", Some("bash\n"), &[other]);
+        std::fs::create_dir_all(root.join("600")).unwrap(); // no fd dir
+        proc_entry(root, "self", Some("x\n"), &[acm0]); // not a pid
+
+        let targets = HashSet::from([acm0.to_path_buf(), usb0.to_path_buf()]);
+        let mut found = holders_in(root, &targets, 400);
+        let named = |pid, comm: &str| Holder::Named {
+            pid,
+            comm: comm.into(),
+        };
+        let mut acm = found.remove(acm0).unwrap();
+        acm.sort_by_key(|h| match h {
+            Holder::Named { pid, .. } => *pid,
+            Holder::Unknown => 0,
+        });
+        assert_eq!(acm, vec![named(100, "esptool"), named(200, "avrdude")]);
+        assert_eq!(found.remove(usb0).unwrap(), vec![named(200, "avrdude")]);
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn holders_in_empty_targets_or_missing_root() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(holders_in(dir.path(), &HashSet::new(), 0).is_empty());
+        let targets = HashSet::from([PathBuf::from("/dev/ttyACM0")]);
+        assert!(holders_in(&dir.path().join("nope"), &targets, 0).is_empty());
+    }
 }

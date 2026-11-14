@@ -307,3 +307,67 @@ fn node_removal_emits_released() {
     drop(child);
     expect_silent(&rx);
 }
+
+/// An open in this process without `note_own_open` stands in for a holder
+/// the /proc scan cannot see (another user, root).
+fn expect_unknown_open(rx: &Receiver<Event>, path: &Path) {
+    let (devnode, holder) = expect_open(rx);
+    assert_eq!(devnode, path);
+    assert_eq!(holder, Holder::Unknown);
+}
+
+#[test]
+fn own_note_on_unwatched_node_is_ignored() {
+    let _g = serial();
+    let pty = make_pty();
+    let (tx, rx) = unbounded();
+    let w = OpenerWatch::spawn(tx).unwrap();
+    // Noted before the node is watched, and that open never happens.
+    w.note_own_open(&pty.path);
+    w.set_watched(vec![pty.path.clone()]);
+    let invisible = File::open(&pty.path).unwrap();
+    expect_unknown_open(&rx, &pty.path);
+    drop(invisible);
+    assert_eq!(expect_released(&rx), pty.path);
+    expect_silent(&rx);
+}
+
+#[test]
+fn cancelled_own_open_does_not_hide_opener() {
+    let _g = serial();
+    let pty = make_pty();
+    let (w, rx) = watch(&pty.path);
+    w.note_own_open(&pty.path);
+    w.cancel_own_open(&pty.path); // comrade's open failed
+    let invisible = File::open(&pty.path).unwrap();
+    expect_unknown_open(&rx, &pty.path);
+    drop(invisible);
+    assert_eq!(expect_released(&rx), pty.path);
+}
+
+#[test]
+fn rewatch_clears_pending_own_ops() {
+    let _g = serial();
+    let pty = make_pty();
+    let (w, rx) = watch(&pty.path);
+    w.note_own_open(&pty.path);
+    w.set_watched(vec![]);
+    w.set_watched(vec![pty.path.clone()]);
+    let invisible = File::open(&pty.path).unwrap();
+    expect_unknown_open(&rx, &pty.path);
+    drop(invisible);
+    assert_eq!(expect_released(&rx), pty.path);
+}
+
+#[test]
+fn drop_stops_reader_thread() {
+    let _g = serial();
+    let pty = make_pty();
+    let (w, rx) = watch(&pty.path);
+    drop(w);
+    // The reader thread holds the only other Sender clone.
+    assert!(matches!(
+        rx.recv_timeout(SLOW),
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+    ));
+}
