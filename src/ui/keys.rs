@@ -1,7 +1,9 @@
 //! Key, mouse and paste handling. Scroll and search mutate the focused tab's
 //! scrollback directly; board-affecting keys come back as `Action`s.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use super::view::{Mode, View};
 use crate::core::{Action, Core};
@@ -378,6 +380,14 @@ pub fn on_mouse(view: &mut View, core: &mut Core, ev: MouseEvent) -> UiOutcome {
             scroll_focused(core, |s| s.scroll_down(3));
             UiOutcome::Redraw
         }
+        MouseEventKind::Down(MouseButton::Left) if ev.row == 0 => view
+            .tab_hits
+            .borrow()
+            .iter()
+            .find(|(cols, _)| cols.contains(&ev.column))
+            .map_or(UiOutcome::None, |&(_, i)| {
+                UiOutcome::Action(Action::Focus(i))
+            }),
         _ => UiOutcome::None,
     }
 }

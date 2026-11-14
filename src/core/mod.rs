@@ -246,9 +246,14 @@ impl Core {
         let mut cmds = Vec::new();
         for path in self.manual_ports.clone() {
             let key = BoardKey(format!("{MANUAL_PREFIX}{}", path.display()));
+            // Under /dev the relative path (`pts/11` reads better than a
+            // bare `11`); elsewhere the file name.
             let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
+                .strip_prefix("/dev")
+                .ok()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.display().to_string())
+                .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()))
                 .unwrap_or_else(|| path.display().to_string());
             let idx = self.find_or_create(key, name, Family::Unknown, now);
             self.open_tab(idx, Some(path), &mut cmds);
@@ -1233,6 +1238,18 @@ mod tests {
         let cmds = c.handle(Event::DeviceAdded(d), now(0));
         assert!(matches!(&cmds[0], Command::Open { baud: 9600, .. }));
         assert_eq!(c.tabs()[0].line_ending, LineEnding::CrLf);
+    }
+
+    #[test]
+    fn manual_port_names_keep_subdir() {
+        let mut c = Core::new(
+            HashMap::new(),
+            115_200,
+            vec!["/dev/pts/11".into(), "/tmp/cmrd".into()],
+        );
+        c.startup(now(0));
+        assert_eq!(c.tabs()[0].name, "pts/11");
+        assert_eq!(c.tabs()[1].name, "cmrd");
     }
 
     #[test]

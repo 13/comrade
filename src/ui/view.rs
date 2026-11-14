@@ -1,7 +1,8 @@
 //! View-only state: modes, input boxes, toggles. No serial or board logic.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::time::Instant;
 
 use crate::board::BoardKey;
@@ -34,6 +35,8 @@ pub struct View {
     pub rate_kbps: HashMap<BoardKey, f64>,
     /// Height of the log area at the last render (for PgUp/PgDn).
     pub last_log_rows: Cell<u16>,
+    /// Columns of row 0 each tab label covered at the last render, for clicks.
+    pub tab_hits: RefCell<Vec<(Range<u16>, usize)>>,
 }
 
 impl Default for View {
@@ -52,6 +55,7 @@ impl Default for View {
             status_msg: None,
             rate_kbps: HashMap::new(),
             last_log_rows: Cell::new(0),
+            tab_hits: RefCell::new(Vec::new()),
         }
     }
 }

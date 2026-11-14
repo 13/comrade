@@ -44,16 +44,20 @@ You never need a flag. These two exist only to override the defaults.
 ### Screen
 
 ```
- comrade  [1 ESP32-S3/C3 ●] [2 Uno ⏸] [3 CH340 ○]                    115200 8N1
-──────────────────────────────────────────────────────────────────────────────
+ ◆ comrade  1 ESP32-S3/C3 ●  2 Uno ⏸  3 CH340 ○                     115200 8N1
+───────────━━━━━━━━━━━━━━━━━──────────────────────────────────────────────────
 14:02:31.204 ESP-ROM:esp32s3-20210327
 14:02:31.206 rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)
-──── reset · 14:02:40 ────
+──────────────────────────── reset · 14:02:40 ────────────────────────────────
 14:02:40.118 ESP-ROM:esp32s3-20210327
 ──────────────────────────────────────────────────────────────────────────────
- >                                                           [Enter sends \n]
- ● /dev/ttyACM1  1.2 kB/s   ↑↓ scroll  End follow  / search  b baud  p pause  ? help
+ ❯ press i to type, / to search                                Enter sends \n
+ LOG  ● connected  /dev/ttyACM1  1.2 kB/s     ? help  / search  i send  b baud
 ```
+
+The heavy line under the tab bar marks the focused tab. The status line starts with the current mode (`LOG`, `SEND`, `SEARCH`, …), then the board's state, device and data rate. The key hints on the right change with the mode and are cut to fit the width. While you are scrolled back, a scrollbar appears at the right edge and a pill counts the lines that arrived since.
+
+comrade uses only the terminal's 16 ANSI colours, so your terminal theme decides the shades. Set `NO_COLOR=1` to turn comrade's own colours off; firmware colours are still shown.
 
 Each tab shows its board's state with one of these glyphs:
 
@@ -70,6 +74,8 @@ comrade adds separator lines to the scrollback:
 - `──── reset · HH:MM:SS ────` when you press `r`, or when an ESP ROM banner line (`ESP-ROM:` or `rst:0x`) appears in the middle of a session.
 - `──── upload · HH:MM:SS ────` when an uploader takes the port.
 
+Separators span the full width. Their label is green for `reconnected`, yellow for `reset` and magenta for `upload`.
+
 comrade never clears the scrollback on its own. It keeps the last 100 000 lines per tab in memory. Firmware ANSI colours are rendered. Each line has a timestamp, taken when its first byte arrived.
 
 ### Keys
@@ -78,7 +84,7 @@ comrade never clears the scrollback on its own. It keeps the last 100 000 lines 
 
 | Key (log mode) | Action |
 |---|---|
-| `1`–`9`, `Tab`/`Shift-Tab` | switch tab |
+| `1`–`9`, `Tab`/`Shift-Tab`, click | switch tab |
 | `↑↓ PgUp PgDn Home End`, wheel | scroll / follow |
 | `/` `n` `N` | search |
 | `i` or `Enter` | focus send box |

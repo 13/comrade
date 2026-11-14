@@ -1,6 +1,7 @@
 //! ratatui rendering and key handling on top of the pure `Core`.
 
 mod keys;
+pub mod theme;
 pub mod view;
 
 pub use keys::{UiOutcome, on_key, on_mouse, on_paste};
@@ -13,8 +14,12 @@ use ansi_to_tui::IntoText;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::scrollbar;
 use ratatui::text::{Line as TLine, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState,
+};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::core::{Core, PauseReason, Tab, TabState};
@@ -27,10 +32,9 @@ use keys::BAUDS;
 /// `HH:MM:SS.mmm` plus one space.
 const TS_WIDTH: u16 = 13;
 const STATUS_TTL: Duration = Duration::from_secs(5);
-
-fn dim() -> Style {
-    Style::new().add_modifier(Modifier::DIM)
-}
+/// Log areas at least this wide keep their last column for the scrollbar.
+const SCROLLBAR_MIN_W: u16 = 20;
+const BRAND: &str = " ◆ comrade ";
 
 fn glyph(s: &TabState) -> &'static str {
     match s {
@@ -41,17 +45,26 @@ fn glyph(s: &TabState) -> &'static str {
     }
 }
 
-fn rule(f: &mut Frame, r: Rect) {
-    f.render_widget(Paragraph::new("─".repeat(r.width as usize)).style(dim()), r);
+fn line_ending(tab: Option<&Tab>) -> &'static str {
+    match tab.map(|t| t.line_ending) {
+        Some(LineEnding::CrLf) => "\\r\\n",
+        Some(LineEnding::None) => "none",
+        _ => "\\n",
+    }
+}
+
+fn spans_width(spans: &[Span]) -> usize {
+    spans.iter().map(|s| s.content.width()).sum()
 }
 
 pub fn render(f: &mut Frame, core: &Core, view: &View) {
     let area = f.area();
+    view.tab_hits.borrow_mut().clear();
     if area.width == 0 || area.height == 0 {
         view.last_log_rows.set(0);
         return;
     }
-    let [bar, rule1, log, rule2, send, status] = Layout::vertical([
+    let [bar, rule, log, rule2, send, status] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(0),
@@ -63,44 +76,135 @@ pub fn render(f: &mut Frame, core: &Core, view: &View) {
     view.last_log_rows.set(log.height);
     let tab = core.tabs().get(core.focus());
 
-    render_bar(f, core, tab, bar);
-    rule(f, rule1);
+    render_bar(f, core, tab, view, bar, rule);
     render_log(f, tab, view, log);
-    rule(f, rule2);
+    f.render_widget(
+        Paragraph::new("─".repeat(rule2.width as usize)).style(theme::muted()),
+        rule2,
+    );
     render_send(f, tab, view, send);
     render_status(f, tab, view, status);
 
+    if matches!(view.mode, Mode::Help | Mode::BaudPicker | Mode::OtherPorts) {
+        dim_backdrop(f, area);
+    }
     match view.mode {
         Mode::Help => overlay_help(f, area),
-        Mode::BaudPicker => overlay_baud(f, view, area),
+        Mode::BaudPicker => overlay_baud(f, tab, view, area),
         Mode::OtherPorts => overlay_ports(f, core, view, area),
         _ => {}
     }
 }
 
-fn render_bar(f: &mut Frame, core: &Core, tab: Option<&Tab>, r: Rect) {
-    let right = tab.map(|t| format!("{} 8N1 ", t.baud)).unwrap_or_default();
-    let rw = right.width() as u16;
-    f.render_widget(Paragraph::new(right).alignment(Alignment::Right), r);
-    let mut spans = vec![Span::styled(
-        " comrade ",
-        Style::new().add_modifier(Modifier::BOLD),
-    )];
-    for (i, t) in core.tabs().iter().enumerate() {
-        let mut st = Style::new();
-        if i == core.focus() {
-            st = st.add_modifier(Modifier::BOLD | Modifier::REVERSED);
-        } else if t.highlight {
-            st = st.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+/// Tab labels and their widths, ` 1 name ● `.
+fn tab_label(i: usize, t: &Tab, focused: bool) -> Vec<Span<'static>> {
+    let name_style = if focused {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else if t.highlight {
+        theme::warn().add_modifier(Modifier::BOLD)
+    } else {
+        theme::muted()
+    };
+    vec![
+        Span::styled(format!(" {} ", i + 1), theme::muted()),
+        Span::styled(t.name.clone(), name_style),
+        Span::raw(" "),
+        Span::styled(glyph(&t.state), theme::state(&t.state)),
+        Span::raw(" "),
+    ]
+}
+
+/// Contiguous run of tabs around `focus` that fits in `avail` columns, with
+/// room for the `‹ ` / ` ›` overflow markers when not everything fits.
+fn visible_tabs(widths: &[usize], focus: usize, avail: usize) -> Range<usize> {
+    if widths.iter().sum::<usize>() <= avail || widths.is_empty() {
+        return 0..widths.len();
+    }
+    let focus = focus.min(widths.len() - 1);
+    let avail = avail.saturating_sub(4);
+    let (mut a, mut b, mut used) = (focus, focus + 1, widths[focus]);
+    loop {
+        if b < widths.len() && used + widths[b] <= avail {
+            used += widths[b];
+            b += 1;
+        } else if a > 0 && used + widths[a - 1] <= avail {
+            a -= 1;
+            used += widths[a];
+        } else {
+            return a..b;
         }
-        spans.push(Span::styled(
-            format!("[{} {} {}]", i + 1, t.name, glyph(&t.state)),
-            st,
-        ));
-        spans.push(Span::raw(" "));
+    }
+}
+
+fn render_bar(f: &mut Frame, core: &Core, tab: Option<&Tab>, view: &View, r: Rect, rule: Rect) {
+    let right: Vec<Span> = match tab {
+        Some(t) => vec![
+            Span::styled(
+                t.baud.to_string(),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" 8N1 ", theme::muted()),
+        ],
+        None => vec![],
+    };
+    let rw = spans_width(&right) as u16;
+    f.render_widget(
+        Paragraph::new(TLine::from(right)).alignment(Alignment::Right),
+        r,
+    );
+
+    let mut spans = vec![Span::styled(BRAND, theme::brand())];
+    let mut x = r.x + BRAND.width() as u16;
+    let labels: Vec<Vec<Span>> = core
+        .tabs()
+        .iter()
+        .enumerate()
+        .map(|(i, t)| tab_label(i, t, i == core.focus()))
+        .collect();
+    let widths: Vec<usize> = labels.iter().map(|l| spans_width(l)).collect();
+    let avail = (r.width.saturating_sub(rw + 1) as usize).saturating_sub(BRAND.width());
+    let shown = visible_tabs(&widths, core.focus(), avail);
+    let mut underline = None;
+    if shown.start > 0 {
+        spans.push(Span::styled("‹ ", theme::muted()));
+        x += 2;
+    }
+    let mut hits = view.tab_hits.borrow_mut();
+    for (i, label) in labels.into_iter().enumerate() {
+        if !shown.contains(&i) {
+            continue;
+        }
+        let w = widths[i] as u16;
+        if i == core.focus() {
+            underline = Some((x, w));
+        }
+        hits.push((x..x + w, i));
+        spans.extend(label);
+        x += w;
+    }
+    if shown.end < widths.len() {
+        spans.push(Span::styled(" ›", theme::muted()));
     }
     let lw = r.width.saturating_sub(rw + 1);
     f.render_widget(Paragraph::new(TLine::from(spans)), Rect { width: lw, ..r });
+
+    // Rule under the bar, heavier and in the accent color under the focused tab.
+    f.render_widget(
+        Paragraph::new("─".repeat(rule.width as usize)).style(theme::muted()),
+        rule,
+    );
+    if let Some((ux, uw)) = underline {
+        let ux = ux.min(rule.right());
+        let uw = uw.min(rule.right() - ux);
+        f.render_widget(
+            Paragraph::new("━".repeat(uw as usize)).style(theme::accent()),
+            Rect {
+                x: ux,
+                width: uw,
+                ..rule
+            },
+        );
+    }
 }
 
 /// Spans for `text` with colors; plain fallback when parsing disagrees with
@@ -142,7 +246,7 @@ fn highlight(spans: Vec<Span<'static>>, needle: &str) -> Vec<Span<'static>> {
         return spans;
     }
     let n = needle.to_ascii_lowercase();
-    let hl = Style::new().bg(Color::Yellow).fg(Color::Black);
+    let hl = theme::search_hit();
     let mut out = Vec::new();
     for s in spans {
         let lower = s.content.to_ascii_lowercase();
@@ -162,22 +266,29 @@ fn highlight(spans: Vec<Span<'static>>, needle: &str) -> Vec<Span<'static>> {
     out
 }
 
+/// `──── label · HH:MM:SS ────`, re-centered to `width` with the label
+/// colored by kind (reconnected, reset, upload).
 fn separator_line(text: &str, width: u16) -> TLine<'static> {
     let plain = strip_sgr(text);
-    let w = plain.width();
-    let total = width as usize;
-    let s = if w >= total {
-        plain.into_owned()
-    } else {
-        let left = (total - w) / 2;
-        format!(
-            "{}{}{}",
-            "─".repeat(left),
-            plain,
-            "─".repeat(total - w - left)
-        )
+    let core = plain.trim_matches(|c| c == '─' || c == ' ');
+    let (label, rest) = match core.split_once(" · ") {
+        Some((l, r)) => (l.to_string(), format!(" · {r}")),
+        None => (core.to_string(), String::new()),
     };
-    TLine::styled(s, dim())
+    let w = label.width() + rest.width() + 2;
+    let total = width as usize;
+    if w >= total {
+        return TLine::styled(plain.into_owned(), theme::muted());
+    }
+    let left = (total - w) / 2;
+    TLine::from(vec![
+        Span::styled(format!("{} ", "─".repeat(left)), theme::muted()),
+        Span::styled(label.clone(), theme::separator_label(&label)),
+        Span::styled(
+            format!("{rest} {}", "─".repeat(total - w - left)),
+            theme::muted(),
+        ),
+    ])
 }
 
 fn data_line(r: &VisibleRow, body_w: u16, ts: bool, wrap: bool, search: &str) -> TLine<'static> {
@@ -191,15 +302,18 @@ fn data_line(r: &VisibleRow, body_w: u16, ts: bool, wrap: bool, search: &str) ->
     .cloned()
     .unwrap_or(0..0);
     let base = match r.line.kind {
-        LineKind::Error => Style::new().fg(Color::Red),
-        LineKind::Info => dim(),
+        LineKind::Error => theme::err(),
+        LineKind::Info => theme::muted().add_modifier(Modifier::ITALIC),
         _ => Style::new(),
     };
     let spans = slice_spans(styled_spans(&r.line.text, &plain), range);
     let mut out = Vec::with_capacity(spans.len() + 1);
     if ts {
         out.push(if r.segment == 0 || !wrap {
-            Span::styled(format!("{} ", r.line.at.format("%H:%M:%S%.3f")), dim())
+            Span::styled(
+                format!("{} ", r.line.at.format("%H:%M:%S%.3f")),
+                theme::muted(),
+            )
         } else {
             Span::raw(" ".repeat(TS_WIDTH as usize))
         });
@@ -211,23 +325,56 @@ fn data_line(r: &VisibleRow, body_w: u16, ts: bool, wrap: bool, search: &str) ->
     TLine::from(out)
 }
 
+fn render_empty(f: &mut Frame, r: Rect) {
+    let lines = vec![
+        TLine::styled("◆ comrade", theme::brand()),
+        TLine::default(),
+        TLine::raw("waiting for a board…"),
+        TLine::styled(
+            "Plug in a USB board. It connects on its own.",
+            theme::muted(),
+        ),
+        TLine::from(vec![
+            Span::styled("c", theme::key()),
+            Span::styled(" other ports   ", theme::muted()),
+            Span::styled("?", theme::key()),
+            Span::styled(" help   ", theme::muted()),
+            Span::styled("q", theme::key()),
+            Span::styled(" quit", theme::muted()),
+        ]),
+    ];
+    let h = (lines.len() as u16).min(r.height);
+    let y = r.y + (r.height - h) / 2;
+    f.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        Rect { y, height: h, ..r },
+    );
+}
+
 fn render_log(f: &mut Frame, tab: Option<&Tab>, view: &View, r: Rect) {
     let Some(tab) = tab else {
-        f.render_widget(Paragraph::new(" waiting for a board…").style(dim()), r);
+        render_empty(f, r);
         return;
     };
-    let ts = view.timestamps && r.width > TS_WIDTH;
+    // The last column is kept free for the scrollbar so wrapping does not
+    // shift when it appears.
+    let bar_w = u16::from(r.width >= SCROLLBAR_MIN_W);
+    let body = Rect {
+        width: r.width - bar_w,
+        ..r
+    };
+    let ts = view.timestamps && body.width > TS_WIDTH;
     let ts_w = if ts { TS_WIDTH } else { 0 };
-    let body_w = r.width.saturating_sub(ts_w).max(1);
+    let body_w = body.width.saturating_sub(ts_w).max(1);
     let rows = tab
         .scroll
-        .visible(r.height, r.width, view.wrap, tab.asm.partial(), ts_w);
+        .visible(body.height, body.width, view.wrap, tab.asm.partial(), ts_w);
     let lines: Vec<TLine> = rows
         .iter()
         .map(|row| {
             if row.line.kind == LineKind::Separator {
                 if row.segment == 0 {
-                    separator_line(&row.line.text, r.width)
+                    separator_line(&row.line.text, body.width)
                 } else {
                     TLine::default()
                 }
@@ -236,58 +383,70 @@ fn render_log(f: &mut Frame, tab: Option<&Tab>, view: &View, r: Rect) {
             }
         })
         .collect();
-    f.render_widget(Paragraph::new(lines), r);
+    f.render_widget(Paragraph::new(lines), body);
 
-    if !tab.scroll.follow() && r.height > 0 {
-        let n = tab.scroll.new_since_freeze();
-        let msg = if n > 0 {
-            format!(" +{n} new ")
-        } else {
-            " scrolled · End follows ".to_string()
-        };
-        let line = Rect {
-            y: r.y + r.height - 1,
-            height: 1,
-            ..r
-        };
-        f.render_widget(
-            Paragraph::new(msg).alignment(Alignment::Right).style(
-                Style::new()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-            ),
-            Rect {
-                x: line.x + line.width.saturating_sub(24),
-                width: line.width.min(24),
-                ..line
-            },
+    if tab.scroll.follow() || r.height == 0 {
+        return;
+    }
+    if bar_w == 1 && tab.scroll.len() > 1 {
+        let mut st = ScrollbarState::new(tab.scroll.len())
+            .position(tab.scroll.position())
+            .viewport_content_length(r.height as usize);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .symbols(scrollbar::VERTICAL)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_style(theme::muted())
+                .thumb_style(theme::accent()),
+            r,
+            &mut st,
         );
     }
+    let n = tab.scroll.new_since_freeze();
+    let msg = if n > 0 {
+        format!(" ↓ +{n} new · End ")
+    } else {
+        " scrolled · End follows ".to_string()
+    };
+    let w = (msg.width() as u16).min(body.width);
+    f.render_widget(
+        Paragraph::new(msg).style(theme::pill()),
+        Rect {
+            x: body.right() - w,
+            y: r.bottom() - 1,
+            width: w,
+            height: 1,
+        },
+    );
 }
 
 fn render_send(f: &mut Frame, tab: Option<&Tab>, view: &View, r: Rect) {
-    let le = match tab.map(|t| t.line_ending) {
-        Some(LineEnding::CrLf) => "\\r\\n",
-        Some(LineEnding::None) => "none",
-        _ => "\\n",
+    let active = matches!(view.mode, Mode::Send | Mode::Search);
+    let right: Vec<Span> = match view.mode {
+        Mode::Search => vec![
+            Span::styled("Enter", theme::key()),
+            Span::styled(" keep  ", theme::muted()),
+            Span::styled("Esc", theme::key()),
+            Span::styled(" cancel ", theme::muted()),
+        ],
+        _ => vec![
+            Span::styled("Enter sends ", theme::muted()),
+            Span::styled(line_ending(tab), theme::accent()),
+            Span::raw(" "),
+        ],
     };
-    let right = format!("[Enter sends {le}] ");
-    let rw = right.width() as u16;
+    let rw = spans_width(&right) as u16;
     f.render_widget(
-        Paragraph::new(right)
-            .alignment(Alignment::Right)
-            .style(dim()),
+        Paragraph::new(TLine::from(right)).alignment(Alignment::Right),
         r,
     );
-    let (prefix, text) = match view.mode {
-        Mode::Search => (" /", &view.search),
-        _ => (" >", &view.input),
+    let (prefix, text, pstyle) = match view.mode {
+        Mode::Search => (" /", &view.search, theme::warn()),
+        Mode::Send => (" ❯", &view.input, theme::accent()),
+        _ => (" ❯", &view.input, theme::muted()),
     };
-    let style = if matches!(view.mode, Mode::Send | Mode::Search) {
-        Style::new()
-    } else {
-        dim()
-    };
+    let pstyle = pstyle.add_modifier(Modifier::BOLD);
     let lw = r.width.saturating_sub(rw + 1);
     // Show the tail of the input so the cursor (at the end) stays visible.
     let avail = (lw as usize).saturating_sub(prefix.width() + 2);
@@ -301,61 +460,165 @@ fn render_send(f: &mut Frame, tab: Option<&Tab>, view: &View, r: Rect) {
         tail_w += w;
         start = i;
     }
+    let body = if !active && text.is_empty() {
+        Span::styled(
+            "press i to type, / to search",
+            theme::muted().add_modifier(Modifier::ITALIC),
+        )
+    } else if active {
+        Span::raw(text[start..].to_string())
+    } else {
+        Span::styled(text[start..].to_string(), theme::muted())
+    };
     f.render_widget(
-        Paragraph::new(format!("{prefix} {}", &text[start..])).style(style),
+        Paragraph::new(TLine::from(vec![
+            Span::styled(prefix, pstyle),
+            Span::raw(" "),
+            body,
+        ])),
         Rect { width: lw, ..r },
     );
-    if matches!(view.mode, Mode::Send | Mode::Search) && r.width > 0 && r.height > 0 {
+    if active && r.width > 0 && r.height > 0 {
         let x = (prefix.width() + 1 + tail_w) as u16;
         f.set_cursor_position((r.x + x.min(r.width - 1), r.y));
     }
 }
 
+fn mode_badge(mode: Mode) -> (&'static str, Color) {
+    match mode {
+        Mode::Log => (" LOG ", Color::Blue),
+        Mode::Send => (" SEND ", Color::Green),
+        Mode::Search => (" SEARCH ", Color::Yellow),
+        Mode::BaudPicker => (" BAUD ", Color::Magenta),
+        Mode::OtherPorts => (" PORTS ", Color::Magenta),
+        Mode::Help => (" HELP ", Color::Magenta),
+    }
+}
+
+fn state_text(s: &TabState) -> String {
+    match s {
+        TabState::Connected => "● connected".into(),
+        TabState::Connecting => "○ connecting".into(),
+        TabState::Waiting => "○ waiting".into(),
+        TabState::Paused(PauseReason::Upload(Holder::Named { pid, comm })) => {
+            format!("⏸ upload in progress ({comm}, pid {pid})")
+        }
+        TabState::Paused(PauseReason::Upload(Holder::Unknown)) => {
+            "⏸ opened by another program".into()
+        }
+        TabState::Paused(PauseReason::Manual) => "⏸ paused".into(),
+        TabState::Error(e) => format!("! {e}"),
+    }
+}
+
+/// Key hints for the status line, most important first.
+fn hints(view: &View, tab: Option<&Tab>) -> Vec<(&'static str, &'static str)> {
+    match view.mode {
+        Mode::Send => vec![
+            ("Enter", "send"),
+            ("^E", "line ending"),
+            ("↑↓", "history"),
+            ("Esc", "back"),
+        ],
+        Mode::Search => vec![("Enter", "keep"), ("Esc", "cancel")],
+        Mode::BaudPicker | Mode::OtherPorts => {
+            vec![("↑↓", "select"), ("Enter", "apply"), ("Esc", "cancel")]
+        }
+        Mode::Help => vec![("any key", "close")],
+        Mode::Log if tab.is_none() => vec![("c", "other ports"), ("?", "help"), ("q", "quit")],
+        Mode::Log => {
+            let mut h = Vec::new();
+            if tab.is_some_and(|t| !t.scroll.follow()) {
+                h.push(("End", "follow"));
+            }
+            if !view.search.is_empty() {
+                h.push(("n/N", "next/prev"));
+            }
+            h.extend([
+                ("?", "help"),
+                ("/", "search"),
+                ("i", "send"),
+                ("b", "baud"),
+                ("p", "pause"),
+                ("r", "reset"),
+                ("q", "quit"),
+            ]);
+            h
+        }
+    }
+}
+
 fn render_status(f: &mut Frame, tab: Option<&Tab>, view: &View, r: Rect) {
-    let hints = "↑↓ scroll  End follow  / search  b baud  p pause  ? help";
-    let mut spans = Vec::new();
-    let (g, node, rate) = match tab {
-        Some(t) => (
-            glyph(&t.state),
-            t.devnode
+    let (label, color) = mode_badge(view.mode);
+    let mut left = vec![
+        Span::styled(label, theme::mode_badge(color)),
+        Span::raw(" "),
+    ];
+    match tab {
+        Some(t) => {
+            left.push(Span::styled(state_text(&t.state), theme::state(&t.state)));
+            let node = t
+                .devnode
                 .as_ref()
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "—".into()),
-            view.rate_kbps.get(&t.key).copied().unwrap_or(0.0),
-        ),
-        None => ("○", "—".into(), 0.0),
-    };
-    spans.push(Span::raw(format!(" {g} {node}  {rate:.1} kB/s   ")));
+                .unwrap_or_else(|| "—".into());
+            let rate = view.rate_kbps.get(&t.key).copied().unwrap_or(0.0);
+            left.push(Span::styled(
+                format!("  {node}  {rate:.1} kB/s"),
+                theme::muted(),
+            ));
+        }
+        None => left.push(Span::styled("○ no board", theme::muted())),
+    }
+    let lw = spans_width(&left);
+    f.render_widget(Paragraph::new(TLine::from(left)), r);
+
+    let avail = (r.width as usize).saturating_sub(lw + 3);
     let msg = view
         .status_msg
         .as_ref()
         .filter(|(_, at)| at.elapsed() < STATUS_TTL)
         .map(|(m, _)| m.clone());
-    match tab.map(|t| &t.state) {
-        Some(TabState::Paused(PauseReason::Upload(Holder::Named { pid, comm }))) => {
-            spans.push(Span::styled(
-                format!("⏸ upload in progress ({comm}, pid {pid})"),
-                Style::new().fg(Color::Yellow),
-            ));
+    let right: Vec<Span> = match msg {
+        Some(m) => vec![Span::styled(
+            format!("{m} "),
+            theme::accent().add_modifier(Modifier::BOLD),
+        )],
+        None => {
+            let mut out: Vec<Span> = Vec::new();
+            let mut used = 0;
+            for (k, d) in hints(view, tab) {
+                let w = k.width() + d.width() + 3;
+                if used + w > avail {
+                    break;
+                }
+                used += w;
+                out.push(Span::styled(k, theme::key()));
+                out.push(Span::styled(format!(" {d}  "), theme::muted()));
+            }
+            out
         }
-        Some(TabState::Paused(PauseReason::Upload(Holder::Unknown))) => {
-            spans.push(Span::styled(
-                "⏸ opened by another program",
-                Style::new().fg(Color::Yellow),
-            ));
-        }
-        Some(TabState::Paused(PauseReason::Manual)) => {
-            spans.push(Span::styled("⏸ paused", Style::new().fg(Color::Yellow)));
-        }
-        Some(TabState::Error(e)) => {
-            spans.push(Span::styled(e.clone(), Style::new().fg(Color::Red)));
-        }
-        _ => match msg {
-            Some(m) => spans.push(Span::raw(m)),
-            None => spans.push(Span::styled(hints, dim())),
+    };
+    let rw = (spans_width(&right) as u16).min(r.width);
+    f.render_widget(
+        Paragraph::new(TLine::from(right)),
+        Rect {
+            x: r.right() - rw,
+            width: rw,
+            ..r
         },
+    );
+}
+
+/// Fade everything behind a modal so the popup reads as the focus.
+fn dim_backdrop(f: &mut Frame, area: Rect) {
+    let buf = f.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buf[(x, y)];
+            cell.modifier.insert(Modifier::DIM);
+        }
     }
-    f.render_widget(Paragraph::new(TLine::from(spans)), r);
 }
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
@@ -369,64 +632,168 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     }
 }
 
+/// Rounded, accent-bordered popup frame with hints in the bottom border.
+fn popup<'a>(title: &'a str, footer: &[(&'a str, &'a str)]) -> Block<'a> {
+    let mut foot = vec![Span::raw(" ")];
+    for (k, d) in footer {
+        foot.push(Span::styled(*k, theme::key()));
+        foot.push(Span::styled(format!(" {d} "), theme::muted()));
+    }
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme::border())
+        .title(TLine::from(vec![
+            Span::raw(" "),
+            Span::styled(title, Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+        ]))
+        .title_bottom(TLine::from(foot).alignment(Alignment::Right))
+        .padding(Padding::horizontal(1))
+}
+
+const HELP: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Tabs",
+        &[
+            ("1-9 Tab S-Tab", "switch (or click tab)"),
+            ("x", "close tab"),
+            ("c", "other ports"),
+        ],
+    ),
+    (
+        "Scrollback",
+        &[
+            ("↑↓ PgUp PgDn", "scroll (or wheel)"),
+            ("Home End", "oldest / follow"),
+            ("/ n N", "search / next / prev"),
+            ("t w", "timestamps / wrap"),
+            ("s C", "save / clear log"),
+        ],
+    ),
+    (
+        "Board",
+        &[
+            ("i Enter", "focus send box"),
+            ("b", "baud picker"),
+            ("p", "pause / resume"),
+            ("r", "reset board"),
+            ("q Ctrl-C", "quit"),
+        ],
+    ),
+    (
+        "Send box",
+        &[
+            ("Enter", "send"),
+            ("Ctrl-E", "cycle line ending"),
+            ("↑↓", "history"),
+            ("Esc", "back to log"),
+        ],
+    ),
+];
+
+fn help_section(section: &str, keys: &[(&str, &str)]) -> Vec<TLine<'static>> {
+    const KEY_W: usize = 15;
+    let mut lines = vec![TLine::styled(
+        section.to_string(),
+        theme::accent().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    )];
+    for (k, d) in keys {
+        let pad = KEY_W.saturating_sub(k.width());
+        lines.push(TLine::from(vec![
+            Span::styled(format!("  {k}{}", " ".repeat(pad)), theme::key()),
+            Span::raw(d.to_string()),
+        ]));
+    }
+    lines
+}
+
+/// Two columns when the terminal is wide enough, one otherwise.
 fn overlay_help(f: &mut Frame, area: Rect) {
-    const HELP: &[&str] = &[
-        "1-9 Tab S-Tab  switch tab",
-        "Up Down PgUp PgDn Home End, wheel  scroll / follow",
-        "/ n N          search / next / previous",
-        "i Enter        focus send box",
-        "b              baud picker",
-        "p              pause / resume",
-        "r              reset board",
-        "t              toggle timestamps",
-        "w              toggle wrap",
-        "c              other ports",
-        "s              save scrollback",
-        "C              clear scrollback",
-        "x              close tab",
-        "q Ctrl-C       quit",
-        "",
-        "Send box: Enter send, Ctrl-E line ending, Up/Down history, Esc back",
-        "",
-        "If ports are grabbed by ModemManager/brltty, disable them for these devices.",
-    ];
-    let r = centered(area, 80, HELP.len() as u16 + 2);
+    const NOTE: &str =
+        "If ports are grabbed by ModemManager/brltty, disable them for these devices.";
+    let two = area.width >= 84;
+    let mut cols: Vec<Vec<TLine>> = vec![Vec::new(); if two { 2 } else { 1 }];
+    let n = cols.len();
+    for (i, (section, keys)) in HELP.iter().enumerate() {
+        let col = &mut cols[i * n / HELP.len()];
+        if !col.is_empty() {
+            col.push(TLine::default());
+        }
+        col.extend(help_section(section, keys));
+    }
+    let body_h = cols.iter().map(Vec::len).max().unwrap_or(0) as u16;
+    let r = centered(area, if two { 84 } else { 82 }, body_h + 4);
     f.render_widget(Clear, r);
-    let items: Vec<TLine> = HELP.iter().map(|s| TLine::raw(format!(" {s}"))).collect();
+    let block = popup("Keys", &[("any key", "close")]);
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let [body, _, note] = Layout::vertical([
+        Constraint::Length(body_h),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    let parts = Layout::horizontal(vec![Constraint::Ratio(1, n as u32); n]).split(body);
+    for (col, rect) in cols.into_iter().zip(parts.iter()) {
+        f.render_widget(Paragraph::new(col), *rect);
+    }
     f.render_widget(
-        Paragraph::new(items).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Help (any key closes) "),
-        ),
-        r,
+        Paragraph::new(NOTE).style(theme::muted().add_modifier(Modifier::ITALIC)),
+        note,
     );
 }
 
-fn picker(f: &mut Frame, area: Rect, title: &str, items: Vec<ListItem<'static>>, sel: usize) {
-    let r = centered(area, 56, items.len() as u16 + 2);
+fn picker(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    footer: &[(&str, &str)],
+    items: Vec<ListItem<'static>>,
+    sel: usize,
+    w: u16,
+) {
+    let r = centered(area, w, items.len() as u16 + 2);
     f.render_widget(Clear, r);
     let list = List::new(items)
-        .block(Block::new().borders(Borders::ALL).title(title.to_string()))
-        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("> ");
+        .block(popup(title, footer))
+        .highlight_style(theme::selected())
+        .highlight_symbol("› ");
     let mut st = ListState::default().with_selected(Some(sel));
     f.render_stateful_widget(list, r, &mut st);
 }
 
-fn overlay_baud(f: &mut Frame, view: &View, area: Rect) {
-    let mut items: Vec<ListItem> = BAUDS.iter().map(|b| ListItem::new(b.to_string())).collect();
+fn overlay_baud(f: &mut Frame, tab: Option<&Tab>, view: &View, area: Rect) {
+    let cur = tab.map(|t| t.baud);
+    let mut items: Vec<ListItem> = BAUDS
+        .iter()
+        .map(|&b| {
+            let mark = if Some(b) == cur {
+                Span::styled("  ● current", theme::ok())
+            } else {
+                Span::raw("")
+            };
+            ListItem::new(TLine::from(vec![Span::raw(format!("{b:>9}")), mark]))
+        })
+        .collect();
     items.push(ListItem::new(if view.picker_idx == BAUDS.len() {
-        format!("custom…  {}_", view.custom_baud)
+        TLine::from(vec![
+            Span::raw("  custom… "),
+            Span::styled(
+                format!("{}▏", view.custom_baud),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+        ])
     } else {
-        "custom…".to_string()
+        TLine::raw("  custom…")
     }));
     picker(
         f,
         area,
-        " Baud (Enter selects, Esc cancels) ",
+        "Baud rate",
+        &[("Enter", "apply"), ("Esc", "cancel")],
         items,
         view.picker_idx,
+        36,
     );
 }
 
@@ -435,24 +802,30 @@ fn overlay_ports(f: &mut Frame, core: &Core, view: &View, area: Rect) {
         .other_ports()
         .iter()
         .map(|d| {
-            ListItem::new(format!(
-                "{}  {:04x}:{:04x}  {}",
-                d.devnode.display(),
-                d.vid,
-                d.pid,
-                d.product.as_deref().unwrap_or("")
-            ))
+            ListItem::new(TLine::from(vec![
+                Span::styled(
+                    d.devnode.display().to_string(),
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  {:04x}:{:04x}  ", d.vid, d.pid), theme::muted()),
+                Span::raw(d.product.clone().unwrap_or_default()),
+            ]))
         })
         .collect();
     if items.is_empty() {
-        items.push(ListItem::new("no other ports"));
+        items.push(ListItem::new(TLine::styled(
+            "no other USB serial ports",
+            theme::muted().add_modifier(Modifier::ITALIC),
+        )));
     }
     picker(
         f,
         area,
-        " Other ports (Enter connects, Esc cancels) ",
+        "Other ports",
+        &[("Enter", "connect"), ("Esc", "cancel")],
         items,
         view.picker_idx,
+        64,
     );
 }
 
@@ -813,8 +1186,12 @@ mod tests {
         assert!(!row.contains("0123"), "{row}");
         let pos = t.get_cursor_position().unwrap();
         assert_eq!(pos.y, y);
-        let idx = row.find("xyz").unwrap() + 3; // ascii only
-        assert_eq!(pos.x as usize, idx);
+        let idx = row.find("xyz").unwrap() + 3;
+        assert_eq!(
+            pos.x as usize,
+            row[..idx].width(),
+            "display column, not byte"
+        );
     }
 
     #[test]
@@ -924,5 +1301,103 @@ mod tests {
         v.mode = Mode::Send;
         on_paste(&mut v, "ab\r\ncd");
         assert_eq!(v.input, "abcd");
+    }
+
+    #[test]
+    fn tab_overflow_keeps_focus_visible() {
+        assert_eq!(visible_tabs(&[5, 5, 5], 0, 20), 0..3);
+        let r = visible_tabs(&[10; 10], 7, 40);
+        assert!(r.contains(&7), "{r:?}");
+        assert!(r.len() * 10 <= 36, "{r:?}");
+        let mut c = core_with(12);
+        c.action(Action::Focus(11), now());
+        let rows = draw(&c, &View::new(), 60, 10);
+        assert!(rows[0].contains("12 "), "{}", rows[0]);
+        assert!(rows[0].contains('‹'), "{}", rows[0]);
+    }
+
+    #[test]
+    fn click_on_tab_focuses_it() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut c = core_with(3);
+        let mut v = View::new();
+        let rows = draw(&c, &v, 100, 10);
+        let col = rows[0][..rows[0].find(" 3 ").unwrap() + 1].width() as u16;
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut t = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        t.draw(|f| render(f, &c, &v)).unwrap();
+        assert_eq!(
+            on_mouse(&mut v, &mut c, click),
+            UiOutcome::Action(Action::Focus(2))
+        );
+        let miss = MouseEvent {
+            column: 99,
+            ..click
+        };
+        assert_eq!(on_mouse(&mut v, &mut c, miss), UiOutcome::None);
+    }
+
+    #[test]
+    fn active_tab_is_underlined_in_accent() {
+        let c = core_with(2);
+        let mut t = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        t.draw(|f| render(f, &c, &View::new())).unwrap();
+        let buf = t.backend().buffer();
+        let heavy: Vec<u16> = (0..80).filter(|&x| buf[(x, 1)].symbol() == "━").collect();
+        assert!(!heavy.is_empty());
+        let row0: String = (0..80).map(|x| buf[(x, 0)].symbol()).collect();
+        let label = format!(" {} ", c.focus() + 1);
+        let focus_col = row0[..row0.find(&label).unwrap()].width() as u16;
+        assert!(heavy.contains(&focus_col), "{heavy:?} {focus_col}");
+    }
+
+    #[test]
+    fn separator_label_is_colored_and_centered() {
+        let l = separator_line("──── reset · 14:02:40 ────", 40);
+        let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text.width(), 40);
+        assert!(text.contains("reset · 14:02:40"));
+        let label = l.spans.iter().find(|s| s.content == "reset").unwrap();
+        assert!(label.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn baud_picker_marks_current() {
+        let mut c = core_with(1);
+        let mut v = View::new();
+        on_key(&mut v, &mut c, ch('b'));
+        let rows = draw(&c, &v, 80, 24);
+        let cur = rows.iter().find(|r| r.contains("current")).unwrap();
+        assert!(cur.contains("115200"), "{cur}");
+    }
+
+    #[test]
+    fn status_shows_mode_and_fits_hints() {
+        let mut c = core_with(1);
+        c.tabs_mut()[0].state = TabState::Connected;
+        let mut v = View::new();
+        let wide = draw(&c, &v, 120, 10);
+        assert!(wide[9].starts_with(" LOG "), "{}", wide[9]);
+        assert!(wide[9].contains("? help") && wide[9].contains("q quit"));
+        let narrow = draw(&c, &v, 50, 10);
+        assert!(!narrow[9].contains("q quit"), "{}", narrow[9]);
+        assert!(narrow[9].contains("connected"));
+        v.mode = Mode::Send;
+        let send = draw(&c, &v, 120, 10);
+        assert!(send[9].starts_with(" SEND ") && send[9].contains("Esc back"));
+    }
+
+    #[test]
+    fn empty_state_explains_what_to_do() {
+        let c = Core::new(HashMap::new(), 115_200, vec![]);
+        let rows = draw(&c, &View::new(), 80, 16);
+        assert!(rows.iter().any(|r| r.contains("waiting for a board")));
+        assert!(rows.iter().any(|r| r.contains("c other ports")));
+        assert!(!rows[15].contains("b baud"), "{}", rows[15]);
     }
 }
