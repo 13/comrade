@@ -50,7 +50,7 @@ Items are grouped by priority. Each item has a check that tells you when it is d
 ## P3: internal quality
 
 - [ ] Measure throughput and CPU at 2 000 000 baud with a pty flood. Check that the UI stays responsive and memory stays bounded with 100 000 lines in several tabs.
-- [ ] Fuzz or property-test the line assembler in `src/lines.rs`: ANSI escapes and multi-byte UTF-8 split across reads, lone `\r`, long lines without a newline.
+- [x] Property-test (done: `chunking_does_not_change_the_lines`, no bug found; `cargo-fuzz` not used) the line assembler in `src/lines.rs`: ANSI escapes and multi-byte UTF-8 split across reads, lone `\r`, long lines without a newline.
 - [ ] Split `src/core/mod.rs` (about 2 500 lines, most of them tests) and `src/ui/mod.rs` (about 1 400 lines) into smaller modules.
-- [ ] Review the non-test `unwrap()` and `expect()` calls (about 90 in `src`, many in tests) and make sure none can fire on device input.
+- [x] Review the non-test `unwrap()` and `expect()` calls: only two remain (`logfile.rs` map lookup just after insert, `store.rs` constant format list). Neither can fire on device input.
 - [ ] The ignored test `enumerates_real_system` in `src/io/udev_watch.rs` needs real hardware. Run it by hand before each release and list it in the checklist.
