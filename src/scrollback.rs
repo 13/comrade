@@ -379,9 +379,9 @@ mod tests {
             s.push(l(&"a".repeat(37)));
         }
         for rows in 1..12 {
-            assert!(s.visible(rows, 10, true, None, 0).len() <= rows as usize);
+            assert_eq!(s.visible(rows, 10, true, None, 0).len(), rows as usize);
             s.scroll_up(3);
-            assert!(s.visible(rows, 10, true, None, 0).len() <= rows as usize);
+            assert_eq!(s.visible(rows, 10, true, None, 0).len(), rows as usize);
             s.end();
         }
     }
@@ -438,5 +438,102 @@ mod tests {
     fn strip_sgr_works() {
         assert_eq!(strip_sgr("a\x1b[1;31mb\x1b[0mc"), "abc");
         assert!(matches!(strip_sgr("plain"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn wide_chars_wrap_by_display_width() {
+        let mut s = Scrollback::new(10);
+        s.push(l("\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}"));
+        // 5 wide chars (width 10) at 4 cols: 2 chars per row -> 3 rows
+        assert_eq!(s.visible(10, 4, true, None, 0).len(), 3);
+    }
+
+    #[test]
+    fn wide_char_wider_than_width_terminates() {
+        assert_eq!(row_count("\u{4e2d}", 1), 1);
+        assert_eq!(row_count("\u{4e2d}\u{4e2d}", 1), 2);
+        let mut s = Scrollback::new(10);
+        s.push(l("\u{4e2d}\u{4e2d}"));
+        assert_eq!(s.visible(10, 1, true, None, 0).len(), 2);
+        assert_eq!(s.visible(10, 0, true, None, 0).len(), 2);
+    }
+
+    #[test]
+    fn frozen_visible_ignores_partial() {
+        let mut s = filled(10);
+        s.scroll_up(2);
+        let p = l("par");
+        let v = s.visible(3, 80, true, Some(&p), 0);
+        assert_eq!(texts(&v), ["5", "6", "7"]);
+        assert!(v.iter().all(|r| !r.is_partial));
+    }
+
+    fn wrapped() -> Scrollback {
+        let mut s = Scrollback::new(10);
+        s.push(l(&"a".repeat(25))); // 3 rows at cols 10
+        s.push(l("bbbbb"));
+        s.push(l("ccccc"));
+        s
+    }
+
+    #[test]
+    fn frozen_wrapped_clips_top_to_bottom_segments() {
+        let mut s = wrapped();
+        s.scroll_up(1); // anchor on "bbbbb"
+        let v = s.visible(3, 10, true, None, 0);
+        assert_eq!(texts(&v), [&"a".repeat(25), &"a".repeat(25), "bbbbb"]);
+        assert_eq!(v.iter().map(|r| r.segment).collect::<Vec<_>>(), [1, 2, 0]);
+    }
+
+    #[test]
+    fn frozen_fills_from_below_anchor() {
+        let mut s = wrapped();
+        s.home();
+        let v = s.visible(5, 10, true, None, 0);
+        assert_eq!(
+            v.iter().map(|r| r.segment).collect::<Vec<_>>(),
+            [0, 1, 2, 0, 0]
+        );
+        assert_eq!(v[3].line.text, "bbbbb");
+        assert_eq!(v[4].line.text, "ccccc");
+    }
+
+    #[test]
+    fn clear_resets() {
+        let mut s = filled(5);
+        s.scroll_up(1);
+        s.push(l("x"));
+        s.clear();
+        assert_eq!(s.len(), 0);
+        assert!(s.follow());
+        assert_eq!(s.new_since_freeze(), 0);
+        assert!(s.visible(3, 80, true, None, 0).is_empty());
+        s.push(l("y"));
+        assert_eq!(texts(&s.visible(3, 80, true, None, 0)), ["y"]);
+    }
+
+    #[test]
+    fn scroll_up_after_end_resets_new_count() {
+        let mut s = filled(10);
+        s.scroll_up(1);
+        s.push(l("a"));
+        s.push(l("b"));
+        assert_eq!(s.new_since_freeze(), 2);
+        s.end();
+        s.scroll_up(1);
+        assert_eq!(s.new_since_freeze(), 0);
+        s.push(l("c"));
+        assert_eq!(s.new_since_freeze(), 1);
+    }
+
+    #[test]
+    fn scroll_down_exactly_to_last_resumes() {
+        let mut s = filled(10);
+        s.scroll_up(3); // anchor 6, last 9
+        s.scroll_down(2); // 8
+        assert!(!s.follow());
+        s.scroll_down(1); // 9 == last
+        assert!(s.follow());
+        assert_eq!(s.new_since_freeze(), 0);
     }
 }
