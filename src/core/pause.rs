@@ -47,6 +47,12 @@ impl PauseTracker {
         }
     }
 
+    /// Drop the holder of `devnode` without a quiet period: the user
+    /// resumed over it (`p`), so it no longer pauses or blocks anything.
+    pub fn forget(&mut self, devnode: &Path) {
+        self.holders.remove(devnode);
+    }
+
     pub fn is_held(&self, devnode: &Path) -> bool {
         self.holders.contains_key(devnode)
     }
@@ -173,6 +179,21 @@ mod tests {
         p.foreign_open(n, esptool(), t0);
         p.foreign_open(n, esptool(), ms(t0, 5000));
         assert_eq!(p.deadline(), Some(t0 + SAFETY));
+    }
+
+    #[test]
+    fn forget_drops_holder_without_quiet_period() {
+        let t0 = Instant::now();
+        let mut p = PauseTracker::new();
+        let n = Path::new("/dev/ttyACM0");
+        p.foreign_open(n, esptool(), t0);
+        p.forget(n);
+        assert!(!p.is_held(n));
+        assert!(p.allows_auto_connect(ms(t0, 1)));
+        assert_eq!(p.deadline(), None);
+        // A later holder starts its own safety window.
+        p.foreign_open(n, esptool(), ms(t0, 5000));
+        assert_eq!(p.deadline(), Some(ms(t0, 5000) + SAFETY));
     }
 
     #[test]

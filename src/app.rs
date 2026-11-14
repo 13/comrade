@@ -256,6 +256,11 @@ impl App {
                         o.set_watched(nodes);
                     }
                 }
+                Command::AcceptHolders { devnode } => {
+                    if let Some(o) = &self.opener {
+                        o.accept_holders(&devnode);
+                    }
+                }
                 Command::Close { key } => {
                     if let Some(p) = self.ports.remove(&key) {
                         self.close_port(p);
@@ -372,16 +377,19 @@ impl App {
     }
 }
 
-/// Execution order within one batch: `Watch`, then `Close`, then `Open`,
-/// then the rest, keeping relative order inside each group. `Watch` goes
-/// first because `note_own_open` is ignored for nodes not yet watched;
-/// `Close` before `Open` so a reopen never overlaps the old fd.
+/// Execution order within one batch: `Watch`, then `AcceptHolders`, then
+/// `Close`, then `Open`, then the rest, keeping relative order inside each
+/// group. `Watch` goes first because `note_own_open` is ignored for nodes
+/// not yet watched; `AcceptHolders` before `Open` so the reopen is never
+/// judged against holders the user already accepted; `Close` before `Open`
+/// so a reopen never overlaps the old fd.
 pub fn order_commands(mut cmds: Vec<Command>) -> Vec<Command> {
     cmds.sort_by_key(|c| match c {
         Command::Watch(_) => 0,
-        Command::Close { .. } => 1,
-        Command::Open { .. } => 2,
-        _ => 3,
+        Command::AcceptHolders { .. } => 1,
+        Command::Close { .. } => 2,
+        Command::Open { .. } => 3,
+        _ => 4,
     });
     cmds
 }
@@ -994,6 +1002,9 @@ mod tests {
             open("o2"),
             Command::Watch(vec!["/dev/x".into()]),
             Command::Close { key: k("c2") },
+            Command::AcceptHolders {
+                devnode: "/dev/x".into(),
+            },
             Command::Write {
                 key: k("w2"),
                 bytes: vec![2],
@@ -1002,6 +1013,9 @@ mod tests {
         let got = order_commands(cmds);
         let want = vec![
             Command::Watch(vec!["/dev/x".into()]),
+            Command::AcceptHolders {
+                devnode: "/dev/x".into(),
+            },
             Command::Close { key: k("c1") },
             Command::Close { key: k("c2") },
             open("o1"),

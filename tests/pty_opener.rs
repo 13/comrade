@@ -371,3 +371,36 @@ fn drop_stops_reader_thread() {
         Err(crossbeam_channel::RecvTimeoutError::Disconnected)
     ));
 }
+
+/// I1: `p` over a stuck holder accepts it; a later uploader is still seen.
+#[test]
+fn accepted_holder_ignored_new_opener_reported() {
+    let _g = serial();
+    let pty = make_pty();
+    let (w, rx) = watch(&pty.path);
+    let stuck = cat_opener(&pty.path);
+    let (_, holder) = expect_open(&rx);
+    assert_named(&holder, stuck.pid(), "cat");
+    w.accept_holders(&pty.path);
+    expect_silent(&rx);
+    // comrade reopens over the accepted holder: silent
+    w.note_own_open(&pty.path);
+    let own = File::open(&pty.path).unwrap();
+    expect_silent(&rx);
+    let second = cat_opener(&pty.path);
+    let (devnode, holder) = expect_open(&rx);
+    assert_eq!(devnode, pty.path);
+    assert_named(&holder, second.pid(), "cat");
+    second.kill();
+    assert_eq!(expect_released(&rx), pty.path);
+    // the accepted holder is not re-reported by the verify scan
+    expect_silent(&rx);
+    // ...and its own exit is silent
+    stuck.kill();
+    expect_silent(&rx);
+    // once it is gone, a third opener still pauses
+    let third = cat_opener(&pty.path);
+    let (_, holder) = expect_open(&rx);
+    assert_named(&holder, third.pid(), "cat");
+    drop(own);
+}

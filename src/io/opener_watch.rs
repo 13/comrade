@@ -98,6 +98,10 @@ struct Shared {
     tx: Sender<Event>,
     /// Receiver gone or `OpenerWatch` dropped: the reader thread exits.
     closed: bool,
+    /// canonical path -> pids the user accepted with `p` (see
+    /// `accept_holders`). Never reported; dropped once they let go.
+    /// Kept per path, not per watch, so a re-watch does not re-report them.
+    ignored: HashMap<PathBuf, HashSet<u32>>,
 }
 
 impl Shared {
@@ -121,6 +125,17 @@ impl Shared {
                 devnode: node.original,
             });
         }
+    }
+
+    /// Drops holders the user accepted for `canon`.
+    fn unignored(&self, canon: &Path, holders: Vec<Holder>) -> Vec<Holder> {
+        let Some(ign) = self.ignored.get(canon) else {
+            return holders;
+        };
+        holders
+            .into_iter()
+            .filter(|h| !pid_of(h).is_some_and(|p| ign.contains(&p)))
+            .collect()
     }
 
     /// Starts watching with state free and no pending own operations.
@@ -166,6 +181,7 @@ impl OpenerWatch {
             by_wd: HashMap::new(),
             tx,
             closed: false,
+            ignored: HashMap::new(),
         }));
         let reader_shared = Arc::clone(&shared);
         thread::Builder::new()
@@ -217,6 +233,7 @@ impl OpenerWatch {
         let found = holders_in(Path::new(PROC), &added, std::process::id());
         let mut s = lock(&self.shared);
         for (canon, holders) in found {
+            let holders = s.unignored(&canon, holders);
             let Some(node) = s.nodes.get_mut(&canon) else {
                 continue; // unwatched meanwhile
             };
@@ -239,6 +256,25 @@ impl OpenerWatch {
                 devnode,
                 holder: first,
             });
+        }
+    }
+
+    /// The user resumed (`p`) over the foreign holders of `node`: its
+    /// current holders are ignored from now on (until they exit), its state
+    /// becomes free, and no event is sent. Any other opener is reported as
+    /// usual.
+    pub fn accept_holders(&self, node: &Path) {
+        let canon = canonical(node);
+        let found = scan_one(&canon);
+        let mut s = lock(&self.shared);
+        let mut pids: HashSet<u32> = found.iter().filter_map(pid_of).collect();
+        if let Some(n) = s.nodes.get_mut(&canon) {
+            pids.extend(n.holders.iter().filter_map(pid_of));
+            n.state = None;
+            n.holders.clear();
+        }
+        if !pids.is_empty() {
+            s.ignored.entry(canon).or_default().extend(pids);
         }
     }
 
@@ -344,16 +380,40 @@ fn scan_one(canon: &Path) -> Vec<Holder> {
         .unwrap_or_default()
 }
 
+fn pid_of(h: &Holder) -> Option<u32> {
+    match h {
+        Holder::Named { pid, .. } => Some(*pid),
+        Holder::Unknown => None,
+    }
+}
+
 fn on_open(shared: &Mutex<Shared>, canon: &Path) {
-    let mut named = scan_one(canon);
+    // Pids already accounted for: recorded holders and accepted ones.
+    let known: HashSet<u32> = {
+        let s = lock(shared);
+        let recorded = s
+            .nodes
+            .get(canon)
+            .into_iter()
+            .flat_map(|n| n.holders.iter().filter_map(pid_of));
+        let ignored = s.ignored.get(canon).into_iter().flatten().copied();
+        recorded.chain(ignored).collect()
+    };
+    // Rescan until a pid we did not know shows up: the opener's fd may not
+    // be installed yet when IN_OPEN arrives.
+    let mut found = scan_one(canon);
     for _ in 0..OPEN_RESCANS {
-        if !named.is_empty() {
+        if found
+            .iter()
+            .any(|h| pid_of(h).is_some_and(|p| !known.contains(&p)))
+        {
             break;
         }
         thread::sleep(OPEN_RESCAN_GAP);
-        named = scan_one(canon);
+        found = scan_one(canon);
     }
     let mut s = lock(shared);
+    let named = s.unignored(canon, found);
     let Some(node) = s.nodes.get_mut(canon) else {
         return;
     };
@@ -400,14 +460,35 @@ pub fn close_action(state: Option<&Holder>, remaining: &[Holder], own: bool) -> 
 }
 
 fn on_close(shared: &Mutex<Shared>, canon: &Path) {
-    let (own, recorded) = {
+    let (own, recorded, ignored) = {
         let mut s = lock(shared);
+        let ignored: Vec<u32> = s
+            .ignored
+            .get(canon)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
         let Some(node) = s.nodes.get_mut(canon) else {
             return;
         };
         let own = take_pending(&mut node.own.closes, Instant::now());
-        (own, node.holders.clone())
+        (own, node.holders.clone(), ignored)
     };
+    // Accepted holders that let go are forgotten (their pid may be reused).
+    if !ignored.is_empty() {
+        let gone: Vec<u32> = ignored
+            .into_iter()
+            .filter(|p| !pid_holds(*p, canon))
+            .collect();
+        let mut s = lock(shared);
+        if let Some(set) = s.ignored.get_mut(canon) {
+            set.retain(|p| !gone.contains(p));
+            if set.is_empty() {
+                s.ignored.remove(canon);
+            }
+        }
+    }
     // Fast path: only the pids we know about. A gone pid counts as released.
     let remaining: Vec<Holder> = recorded
         .into_iter()
@@ -448,6 +529,7 @@ fn verify_release(shared: &Mutex<Shared>, canon: &Path) {
         return;
     }
     let mut s = lock(shared);
+    let found = s.unignored(canon, found);
     let Some(node) = s.nodes.get_mut(canon) else {
         return;
     };
@@ -477,6 +559,9 @@ fn verify_release(shared: &Mutex<Shared>, canon: &Path) {
 fn resync(s: &mut Shared) {
     let targets: HashSet<PathBuf> = s.nodes.keys().cloned().collect();
     let mut found = holders_in(Path::new(PROC), &targets, std::process::id());
+    for (canon, hs) in found.iter_mut() {
+        *hs = s.unignored(canon, std::mem::take(hs));
+    }
     let mut out = Vec::new();
     for (canon, node) in s.nodes.iter_mut() {
         node.own = OwnPending::default();
@@ -508,9 +593,11 @@ fn resync(s: &mut Shared) {
 /// Whether a recorded holder still has `canon` open. Reads only that pid's
 /// fd dir. An exited (or now unreadable) pid counts as released.
 fn still_holds(holder: &Holder, canon: &Path) -> bool {
-    let Holder::Named { pid, .. } = holder else {
-        return false;
-    };
+    pid_of(holder).is_some_and(|p| pid_holds(p, canon))
+}
+
+/// Whether process `pid` has `canon` open.
+fn pid_holds(pid: u32, canon: &Path) -> bool {
     let Ok(fds) = std::fs::read_dir(Path::new(PROC).join(pid.to_string()).join("fd")) else {
         return false;
     };

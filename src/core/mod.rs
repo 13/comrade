@@ -836,6 +836,20 @@ impl Core {
                 t.conn = 0;
                 cmds.push(Command::Close { key: t.key.clone() });
             }
+            TabState::Paused(PauseReason::Upload(_)) => {
+                // Resume over a foreign holder (stuck, or a second monitor):
+                // accept it. It stops pausing this tab and blocking
+                // auto-connect, and a later opener is detected as usual.
+                if let Some(node) = t.upload_node.take().or_else(|| t.devnode.clone()) {
+                    self.pause.forget(&node);
+                    cmds.push(Command::AcceptHolders { devnode: node });
+                }
+                let t = &mut self.tabs[idx];
+                t.state = TabState::Waiting;
+                if t.devnode.is_some() {
+                    self.open_tab(idx, None, cmds);
+                }
+            }
             _ => {
                 if t.devnode.is_some() {
                     self.open_tab(idx, None, cmds);
@@ -871,7 +885,7 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::path::Path;
 
     fn dev(vid: u16, pid: u16, serial: &str, node: &str) -> DeviceInfo {
         DeviceInfo {
@@ -2327,6 +2341,102 @@ mod tests {
         let cmds = c.on_timer(now(520));
         assert_eq!(opens(&cmds).len(), 1);
         assert!(pulses(&cmds).is_empty());
+    }
+
+    #[test]
+    fn manual_resume_over_stuck_holder_accepts_it() {
+        let mut c = Core::new(HashMap::new(), 115_200, vec!["/tmp/cmrd".into()]);
+        let conn = opens(&c.startup(now(0)))[0].0;
+        let key = c.tabs()[0].key.clone();
+        c.handle(
+            Event::PortOpened {
+                key: key.clone(),
+                conn,
+            },
+            now(1),
+        );
+        let socat = Holder::Named {
+            pid: 77,
+            comm: "socat".into(),
+        };
+        foreign_open(&mut c, "/tmp/cmrd", socat, 2);
+        // p: resume over the stuck holder.
+        let cmds = c.action(Action::TogglePause, now(1000));
+        assert!(
+            cmds.contains(&Command::AcceptHolders {
+                devnode: "/tmp/cmrd".into()
+            }),
+            "{cmds:?}"
+        );
+        let o = opens(&cmds);
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].1, PathBuf::from("/tmp/cmrd"));
+        assert!(!c.pause.is_held(Path::new("/tmp/cmrd")));
+        assert!(c.pause.allows_auto_connect(now(1000).mono));
+        c.handle(
+            Event::PortOpened {
+                key: key.clone(),
+                conn: o[0].0,
+            },
+            now(1001),
+        );
+        assert_eq!(c.tabs()[0].state, TabState::Connected);
+        // A new uploader pauses again, and its release reopens.
+        let cmds = foreign_open(&mut c, "/tmp/cmrd", esptool(), 2000);
+        assert!(cmds.contains(&Command::Close { key: key.clone() }));
+        assert_eq!(
+            c.tabs()[0].state,
+            TabState::Paused(PauseReason::Upload(esptool()))
+        );
+        foreign_released(&mut c, "/tmp/cmrd", 3000);
+        let o = opens(&c.on_timer(now(3500)));
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].1, PathBuf::from("/tmp/cmrd"));
+    }
+
+    #[test]
+    fn manual_resume_over_stuck_holder_on_bridge_reopens_instantly_after_next_upload() {
+        let mut c = core();
+        let (key, _) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        foreign_open(&mut c, "/dev/ttyUSB0", Holder::Unknown, 2);
+        let cmds = c.action(Action::TogglePause, now(10));
+        assert!(cmds.contains(&Command::AcceptHolders {
+            devnode: "/dev/ttyUSB0".into()
+        }));
+        let conn = opens(&cmds)[0].0;
+        c.handle(
+            Event::PortOpened {
+                key: key.clone(),
+                conn,
+            },
+            now(11),
+        );
+        foreign_open(&mut c, "/dev/ttyUSB0", esptool(), 20);
+        assert_eq!(
+            opens(&foreign_released(&mut c, "/dev/ttyUSB0", 30)).len(),
+            1
+        );
+        // Replug after the quiet period reconnects.
+        removed(&mut c, "/dev/ttyUSB0", 40);
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x10c4, 0xea60, "A", "/dev/ttyUSB1")),
+            now(600),
+        );
+        assert_eq!(opens(&cmds).len(), 1);
+    }
+
+    #[test]
+    fn manual_pause_toggle_does_not_accept_holders() {
+        let mut c = core();
+        connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        c.action(Action::TogglePause, now(2));
+        let cmds = c.action(Action::TogglePause, now(3));
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Command::AcceptHolders { .. }))
+        );
+        assert_eq!(opens(&cmds).len(), 1);
     }
 
     #[test]

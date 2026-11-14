@@ -95,6 +95,11 @@ pub enum Command {
         family: Family,
     },
     Watch(Vec<PathBuf>),
+    /// The user resumed (`p`) over a foreign holder: stop reporting the
+    /// node's current holders; later openers are reported as usual.
+    AcceptHolders {
+        devnode: PathBuf,
+    },
     Persist {
         key: BoardKey,
         prefs: crate::store::BoardPrefs,
