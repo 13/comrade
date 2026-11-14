@@ -60,8 +60,14 @@ pub fn classify(vid: u16, pid: u16) -> Class {
 
 pub fn line_policy(f: Family) -> LinePolicy {
     match f {
-        Family::UartBridge | Family::EspUsbJtag => LinePolicy { dtr: false, rts: false },
-        Family::NativeCdc | Family::Unknown => LinePolicy { dtr: true, rts: false },
+        Family::UartBridge | Family::EspUsbJtag => LinePolicy {
+            dtr: false,
+            rts: false,
+        },
+        Family::NativeCdc | Family::Unknown => LinePolicy {
+            dtr: true,
+            rts: false,
+        },
     }
 }
 
@@ -96,12 +102,17 @@ pub fn friendly_name(d: &DeviceInfo) -> String {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn dev(vid: u16, pid: u16, serial: Option<&str>, id_path: Option<&str>, node: &str) -> DeviceInfo {
+    fn dev(
+        vid: u16,
+        pid: u16,
+        serial: Option<&str>,
+        id_path: Option<&str>,
+        node: &str,
+    ) -> DeviceInfo {
         DeviceInfo {
             devnode: PathBuf::from(node),
             vid,
@@ -137,10 +148,34 @@ mod tests {
     }
     #[test]
     fn policies() {
-        assert_eq!(line_policy(Family::UartBridge), LinePolicy { dtr: false, rts: false });
-        assert_eq!(line_policy(Family::EspUsbJtag), LinePolicy { dtr: false, rts: false });
-        assert_eq!(line_policy(Family::NativeCdc), LinePolicy { dtr: true, rts: false });
-        assert_eq!(line_policy(Family::Unknown), LinePolicy { dtr: true, rts: false });
+        assert_eq!(
+            line_policy(Family::UartBridge),
+            LinePolicy {
+                dtr: false,
+                rts: false
+            }
+        );
+        assert_eq!(
+            line_policy(Family::EspUsbJtag),
+            LinePolicy {
+                dtr: false,
+                rts: false
+            }
+        );
+        assert_eq!(
+            line_policy(Family::NativeCdc),
+            LinePolicy {
+                dtr: true,
+                rts: false
+            }
+        );
+        assert_eq!(
+            line_policy(Family::Unknown),
+            LinePolicy {
+                dtr: true,
+                rts: false
+            }
+        );
     }
     #[test]
     fn key_prefers_serial() {
@@ -149,10 +184,28 @@ mod tests {
     }
     #[test]
     fn serialless_boards_keyed_by_path() {
-        let a = dev(0x1a86, 0x7523, None, Some("pci-0000:00:14.0-usb-0:1:1.0"), "/dev/ttyUSB0");
-        let b = dev(0x1a86, 0x7523, None, Some("pci-0000:00:14.0-usb-0:2:1.0"), "/dev/ttyUSB1");
+        let a = dev(
+            0x1a86,
+            0x7523,
+            None,
+            Some("pci-0000:00:14.0-usb-0:1:1.0"),
+            "/dev/ttyUSB0",
+        );
+        let b = dev(
+            0x1a86,
+            0x7523,
+            None,
+            Some("pci-0000:00:14.0-usb-0:2:1.0"),
+            "/dev/ttyUSB1",
+        );
         assert_ne!(board_key(&a), board_key(&b));
-        let a2 = dev(0x1a86, 0x7523, None, Some("pci-0000:00:14.0-usb-0:1:1.0"), "/dev/ttyUSB1");
+        let a2 = dev(
+            0x1a86,
+            0x7523,
+            None,
+            Some("pci-0000:00:14.0-usb-0:1:1.0"),
+            "/dev/ttyUSB1",
+        );
         assert_eq!(board_key(&a), board_key(&a2));
         assert_eq!(board_key(&a).0, "1a86:7523@pci-0000:00:14.0-usb-0:1:1.0");
     }
@@ -163,13 +216,28 @@ mod tests {
     }
     #[test]
     fn friendly_names() {
-        assert_eq!(friendly_name(&dev(0x303a, 0x1001, None, None, "x")), "ESP32-S3/C3");
+        assert_eq!(
+            friendly_name(&dev(0x303a, 0x1001, None, None, "x")),
+            "ESP32-S3/C3"
+        );
         assert_eq!(friendly_name(&dev(0x2341, 0x0043, None, None, "x")), "Uno");
-        assert_eq!(friendly_name(&dev(0x2341, 0x8036, None, None, "x")), "Leonardo");
-        assert_eq!(friendly_name(&dev(0x1a86, 0x7523, None, None, "x")), "CH340");
-        assert_eq!(friendly_name(&dev(0x10c4, 0xea60, None, None, "x")), "CP210x");
+        assert_eq!(
+            friendly_name(&dev(0x2341, 0x8036, None, None, "x")),
+            "Leonardo"
+        );
+        assert_eq!(
+            friendly_name(&dev(0x1a86, 0x7523, None, None, "x")),
+            "CH340"
+        );
+        assert_eq!(
+            friendly_name(&dev(0x10c4, 0xea60, None, None, "x")),
+            "CP210x"
+        );
         assert_eq!(friendly_name(&dev(0x0403, 0x6001, None, None, "x")), "FTDI");
-        assert_eq!(friendly_name(&dev(0x2e8a, 0x000a, None, None, "x")), "RP2040");
+        assert_eq!(
+            friendly_name(&dev(0x2e8a, 0x000a, None, None, "x")),
+            "RP2040"
+        );
         let mut d = dev(0x1234, 0x5678, None, None, "x");
         assert_eq!(friendly_name(&d), "1234:5678");
         d.product = Some("Widget".into());

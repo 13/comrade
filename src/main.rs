@@ -2,6 +2,7 @@
 
 mod board;
 mod event;
+mod lines;
 mod store;
 
 fn main() {}

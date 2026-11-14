@@ -24,23 +24,65 @@ pub enum OpenError {
 
 pub enum Event {
     DeviceAdded(DeviceInfo),
-    DeviceRemoved { devnode: PathBuf },
-    PortOpened { key: BoardKey, conn: ConnId },
-    PortOpenFailed { key: BoardKey, conn: ConnId, err: OpenError },
-    PortData { key: BoardKey, conn: ConnId, bytes: Vec<u8> },
-    PortGone { key: BoardKey, conn: ConnId, reason: String },
-    ForeignOpen { devnode: PathBuf, holder: Holder },
-    ForeignReleased { devnode: PathBuf },
+    DeviceRemoved {
+        devnode: PathBuf,
+    },
+    PortOpened {
+        key: BoardKey,
+        conn: ConnId,
+    },
+    PortOpenFailed {
+        key: BoardKey,
+        conn: ConnId,
+        err: OpenError,
+    },
+    PortData {
+        key: BoardKey,
+        conn: ConnId,
+        bytes: Vec<u8>,
+    },
+    PortGone {
+        key: BoardKey,
+        conn: ConnId,
+        reason: String,
+    },
+    ForeignOpen {
+        devnode: PathBuf,
+        holder: Holder,
+    },
+    ForeignReleased {
+        devnode: PathBuf,
+    },
     Input(crossterm::event::Event),
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Command {
-    Open { key: BoardKey, conn: ConnId, devnode: PathBuf, baud: u32, policy: LinePolicy },
-    Close { key: BoardKey },
-    Write { key: BoardKey, bytes: Vec<u8> },
-    SetBaud { key: BoardKey, baud: u32 },
-    ResetPulse { key: BoardKey, family: Family },
+    Open {
+        key: BoardKey,
+        conn: ConnId,
+        devnode: PathBuf,
+        baud: u32,
+        policy: LinePolicy,
+    },
+    Close {
+        key: BoardKey,
+    },
+    Write {
+        key: BoardKey,
+        bytes: Vec<u8>,
+    },
+    SetBaud {
+        key: BoardKey,
+        baud: u32,
+    },
+    ResetPulse {
+        key: BoardKey,
+        family: Family,
+    },
     Watch(Vec<PathBuf>),
-    Persist { key: BoardKey, prefs: crate::store::BoardPrefs },
+    Persist {
+        key: BoardKey,
+        prefs: crate::store::BoardPrefs,
+    },
 }
