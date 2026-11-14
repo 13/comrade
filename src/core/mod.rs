@@ -17,6 +17,7 @@ use crate::store::{BoardPrefs, LineEnding};
 use pause::PauseTracker;
 
 const SCROLLBACK_CAP: usize = 100_000;
+const BANNER_QUIET: u8 = 8;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PauseReason {
@@ -48,6 +49,8 @@ pub struct Tab {
     pub rx_bytes: u64,
     ever_connected: bool,
     data_this_conn: bool,
+    /// Completed non-banner lines still to see before a banner counts as a new reset.
+    banner_quiet: u8,
 }
 
 pub enum Action {
@@ -172,6 +175,7 @@ impl Core {
                     t.state = TabState::Connected;
                     if t.ever_connected {
                         t.scroll.push(separator(now, "reconnected"));
+                        t.banner_quiet = BANNER_QUIET;
                     }
                     t.ever_connected = true;
                 }
@@ -207,6 +211,7 @@ impl Core {
                     Self::flush_partial(t);
                     t.state = TabState::Waiting;
                     t.devnode = None;
+                    t.conn = 0;
                     cmds.push(Command::Close { key });
                 }
             }
@@ -256,6 +261,8 @@ impl Core {
             Action::Reset => {
                 if let Some(t) = self.tabs.get_mut(self.focus) {
                     if t.state == TabState::Connected {
+                        Self::flush_partial(t);
+                        t.banner_quiet = BANNER_QUIET;
                         cmds.push(Command::ResetPulse {
                             key: t.key.clone(),
                             family: t.family,
@@ -354,6 +361,7 @@ impl Core {
             rx_bytes: 0,
             ever_connected: false,
             data_this_conn: false,
+            banner_quiet: 0,
         });
         let idx = self.tabs.len() - 1;
         if self.tabs.len() > 1 && focused_connected {
@@ -398,10 +406,25 @@ impl Core {
                 if self.suppressed.contains(&key) {
                     return;
                 }
+                // A tab (e.g. a --port one) already owns this node.
+                if self
+                    .tabs
+                    .iter()
+                    .any(|t| t.key != key && t.devnode.as_ref() == Some(&dev.devnode))
+                {
+                    return;
+                }
                 let idx = self.find_or_create(key, friendly_name(&dev), family, now);
-                self.tabs[idx].devnode = Some(dev.devnode.clone());
-                if self.pause.allows_auto_connect(now.mono) {
-                    self.open_tab(idx, Some(dev.devnode), cmds);
+                let t = &mut self.tabs[idx];
+                let same_node = t.devnode.as_ref() == Some(&dev.devnode);
+                t.devnode = Some(dev.devnode.clone());
+                match t.state {
+                    TabState::Connecting | TabState::Connected if same_node => {}
+                    TabState::Paused(PauseReason::Manual) => {}
+                    _ if self.pause.allows_auto_connect(now.mono) => {
+                        self.open_tab(idx, Some(dev.devnode), cmds);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -426,6 +449,7 @@ impl Core {
                 Self::flush_partial(t);
                 t.state = TabState::Waiting;
                 t.devnode = None;
+                t.conn = 0;
                 cmds.push(Command::Close { key: t.key.clone() });
             }
             TabState::Paused(PauseReason::Manual) => t.devnode = None,
@@ -443,11 +467,15 @@ impl Core {
         }
         t.rx_bytes += bytes.len() as u64;
         let pushed = t.asm.push(bytes, now.wall);
-        let mut sep_done = !(pushed.rom_banner && t.data_this_conn);
+        let had_data = t.data_this_conn;
         for l in pushed.complete {
-            if !sep_done && is_rom_banner(&l) {
-                t.scroll.push(separator(now, "reset"));
-                sep_done = true;
+            if is_rom_banner(&l) {
+                if had_data && t.banner_quiet == 0 {
+                    t.scroll.push(separator(now, "reset"));
+                }
+                t.banner_quiet = BANNER_QUIET;
+            } else {
+                t.banner_quiet = t.banner_quiet.saturating_sub(1);
             }
             t.scroll.push(l);
         }
@@ -501,6 +529,7 @@ impl Core {
             TabState::Connecting | TabState::Connected => {
                 Self::flush_partial(t);
                 t.state = TabState::Paused(PauseReason::Manual);
+                t.conn = 0;
                 cmds.push(Command::Close { key: t.key.clone() });
             }
             _ => {
@@ -788,17 +817,15 @@ mod tests {
                 now(5),
             );
         };
-        // Banner as the first data of a connection: no separator.
-        feed(b"ESP-ROM:esp32s3\n");
-        feed(b"hello\n");
-        feed(b"ESP-ROM:esp32s3\n");
-        let t = &c.tabs()[0];
-        let v = texts(t);
-        assert_eq!(v.len(), 4);
-        assert_eq!(v[0], "ESP-ROM:esp32s3");
-        assert!(v[2].starts_with("──── reset · "));
-        assert_eq!(t.scroll.get(2).unwrap().kind, LineKind::Separator);
-        assert_eq!(v[3], "ESP-ROM:esp32s3");
+        feed(b"ESP-ROM:esp32s3-20210327\r\nBuild:Mar 27 2021\r\nrst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\r\n");
+        for i in 0..10 {
+            feed(format!("log {i}\r\n").as_bytes());
+        }
+        feed(b"ESP-ROM:esp32s3-20210327\r\nBuild:Mar 27 2021\r\nrst:0x1 (POWERON),boot:0x8\r\n");
+        let v = texts(&c.tabs()[0]);
+        assert_eq!(v.iter().filter(|l| l.contains("reset")).count(), 1);
+        assert!(v[13].starts_with("──── reset · "), "{v:?}");
+        assert_eq!(v[14], "ESP-ROM:esp32s3-20210327");
     }
 
     #[test]
@@ -989,5 +1016,173 @@ mod tests {
             now(2),
         );
         assert!(cmds.is_empty());
+    }
+
+    const S3: &[u8] = b"ESP-ROM:esp32s3-20210327\r\nBuild:Mar 27 2021\r\nrst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\r\n";
+
+    fn data(c: &mut Core, key: &BoardKey, conn: ConnId, b: &[u8]) {
+        c.handle(
+            Event::PortData {
+                key: key.clone(),
+                conn,
+                bytes: b.to_vec(),
+            },
+            now(5),
+        );
+    }
+
+    fn seps(c: &Core, word: &str) -> usize {
+        texts(&c.tabs()[0])
+            .iter()
+            .filter(|l| l.starts_with("────") && l.contains(word))
+            .count()
+    }
+
+    #[test]
+    fn late_port_opened_after_pause_ignored() {
+        let mut c = core();
+        let d = dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0");
+        let key = board_key(&d);
+        let cmds = c.handle(Event::DeviceAdded(d), now(0));
+        let conn = opens(&cmds)[0].0;
+        c.action(Action::TogglePause, now(1));
+        let cmds = c.handle(Event::PortOpened { key, conn }, now(2));
+        assert!(cmds.is_empty());
+        assert_eq!(c.tabs()[0].state, TabState::Paused(PauseReason::Manual));
+    }
+
+    #[test]
+    fn late_open_failed_after_pause_ignored() {
+        let mut c = core();
+        let d = dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0");
+        let key = board_key(&d);
+        let cmds = c.handle(Event::DeviceAdded(d), now(0));
+        let conn = opens(&cmds)[0].0;
+        c.action(Action::TogglePause, now(1));
+        let cmds = c.handle(
+            Event::PortOpenFailed {
+                key,
+                conn,
+                err: OpenError::Other("boom".into()),
+            },
+            now(2),
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(c.tabs()[0].state, TabState::Paused(PauseReason::Manual));
+        assert_eq!(c.tabs()[0].scroll.len(), 0);
+    }
+
+    #[test]
+    fn late_port_opened_after_unplug_ignored() {
+        let mut c = core();
+        let d = dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0");
+        let key = board_key(&d);
+        let cmds = c.handle(Event::DeviceAdded(d.clone()), now(0));
+        let conn = opens(&cmds)[0].0;
+        c.handle(Event::DeviceRemoved { devnode: d.devnode }, now(1));
+        c.handle(Event::PortOpened { key, conn }, now(2));
+        assert_eq!(c.tabs()[0].state, TabState::Waiting);
+        assert_eq!(c.tabs()[0].devnode, None);
+    }
+
+    #[test]
+    fn s3_banner_split_across_pushes_one_separator() {
+        let mut c = core();
+        let (key, conn) = connect(&mut c, dev(0x303a, 0x1001, "S", "/dev/ttyACM0"));
+        data(&mut c, &key, conn, b"hello\r\n");
+        data(&mut c, &key, conn, &S3[..30]);
+        data(&mut c, &key, conn, &S3[30..60]);
+        data(&mut c, &key, conn, &S3[60..]);
+        assert_eq!(seps(&c, "reset"), 1);
+    }
+
+    #[test]
+    fn banner_after_action_reset_only_reset_separator() {
+        let mut c = core();
+        let (key, conn) = connect(&mut c, dev(0x303a, 0x1001, "S", "/dev/ttyACM0"));
+        data(&mut c, &key, conn, b"hello\r\nprompt> ");
+        c.action(Action::Reset, now(2));
+        data(&mut c, &key, conn, &S3[..40]);
+        data(&mut c, &key, conn, &S3[40..]);
+        assert_eq!(seps(&c, "reset"), 1);
+        let v = texts(&c.tabs()[0]);
+        assert_eq!(v[1], "prompt> ");
+        assert!(v[2].starts_with("──── reset"));
+        assert_eq!(v[3], "ESP-ROM:esp32s3-20210327");
+    }
+
+    #[test]
+    fn banner_after_reconnect_only_reconnected_separator() {
+        let mut c = core();
+        let d = dev(0x303a, 0x1001, "S", "/dev/ttyACM0");
+        let (key, conn) = connect(&mut c, d.clone());
+        data(&mut c, &key, conn, b"hello\r\n");
+        c.handle(
+            Event::DeviceRemoved {
+                devnode: d.devnode.clone(),
+            },
+            now(2),
+        );
+        let cmds = c.handle(Event::DeviceAdded(d), now(3));
+        let conn = opens(&cmds)[0].0;
+        c.handle(
+            Event::PortOpened {
+                key: key.clone(),
+                conn,
+            },
+            now(4),
+        );
+        data(&mut c, &key, conn, &S3[..50]);
+        data(&mut c, &key, conn, &S3[50..]);
+        assert_eq!(seps(&c, "reconnected"), 1);
+        assert_eq!(seps(&c, "reset"), 0);
+    }
+
+    #[test]
+    fn port_flag_on_auto_board_makes_one_tab() {
+        let mut c = Core::new(HashMap::new(), 115_200, vec!["/dev/ttyUSB0".into()]);
+        let cmds = c.startup(now(0));
+        assert_eq!(opens(&cmds).len(), 1);
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0")),
+            now(1),
+        );
+        assert!(opens(&cmds).is_empty());
+        assert_eq!(c.tabs().len(), 1);
+    }
+
+    #[test]
+    fn replug_of_manually_paused_tab_does_not_reopen() {
+        let mut c = core();
+        let d = dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0");
+        connect(&mut c, d.clone());
+        c.action(Action::TogglePause, now(2));
+        c.handle(
+            Event::DeviceRemoved {
+                devnode: d.devnode.clone(),
+            },
+            now(3),
+        );
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x10c4, 0xea60, "A", "/dev/ttyUSB1")),
+            now(4),
+        );
+        assert!(opens(&cmds).is_empty());
+        assert_eq!(c.tabs()[0].state, TabState::Paused(PauseReason::Manual));
+        assert_eq!(c.tabs()[0].devnode, Some("/dev/ttyUSB1".into()));
+    }
+
+    #[test]
+    fn duplicate_device_added_does_not_reopen() {
+        let mut c = core();
+        let d = dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0");
+        c.handle(Event::DeviceAdded(d.clone()), now(0));
+        let cmds = c.handle(Event::DeviceAdded(d.clone()), now(1));
+        assert!(opens(&cmds).is_empty());
+        let key = board_key(&d);
+        c.handle(Event::PortOpened { key, conn: 1 }, now(2));
+        let cmds = c.handle(Event::DeviceAdded(d), now(3));
+        assert!(opens(&cmds).is_empty());
+        assert_eq!(c.tabs()[0].state, TabState::Connected);
     }
 }
