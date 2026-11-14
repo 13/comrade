@@ -107,6 +107,8 @@ pub struct Core {
     pause: PauseTracker,
     /// Set by `startup_done`: `DeviceAdded` is a hotplug, not enumeration.
     hotplug: bool,
+    /// Send `Watch` from `finish` even if the set is unchanged.
+    rewatch: bool,
 }
 
 fn line(now: Now, kind: LineKind, text: String) -> Line {
@@ -161,6 +163,7 @@ impl Core {
             last_watch: Vec::new(),
             pause: PauseTracker::new(),
             hotplug: false,
+            rewatch: false,
         }
     }
 
@@ -442,7 +445,7 @@ impl Core {
             .collect();
         watch.sort();
         watch.dedup();
-        if watch != self.last_watch {
+        if watch != self.last_watch || std::mem::take(&mut self.rewatch) {
             self.last_watch = watch.clone();
             cmds.push(Command::Watch(watch));
         }
@@ -532,6 +535,14 @@ impl Core {
         t.data_this_conn = false;
         t.retry_at = None;
         t.await_unblock = false;
+        // `--port` / `c` paths are not udev-tracked: the node may have been
+        // missing, or the path may lead to a new node (a recreated pty
+        // symlink), since the watch set was last sent. Re-send it, so the
+        // opener watch watches the node before this open (`Watch` runs
+        // first in a batch) and an uploader on it is seen.
+        if t.family == Family::Unknown {
+            self.rewatch = true;
+        }
         let policy: LinePolicy = line_policy(t.family);
         cmds.push(Command::Open {
             key: t.key.clone(),
@@ -2199,6 +2210,27 @@ mod tests {
         );
         assert_eq!(c.next_deadline(), Some(now(3002).mono));
         assert_eq!(c.tabs()[0].scroll.len(), 1);
+    }
+
+    #[test]
+    fn manual_port_open_rewatches_its_path() {
+        // The path may have been missing (or point at a new pty) when the
+        // watch set was last sent; every open re-sends it.
+        let mut c = Core::new(HashMap::new(), 115_200, vec!["/tmp/cmrd-late".into()]);
+        let cmds = c.startup(now(0));
+        assert!(cmds.contains(&Command::Watch(vec!["/tmp/cmrd-late".into()])));
+        let key = c.tabs()[0].key.clone();
+        c.handle(
+            Event::PortOpenFailed {
+                key,
+                conn: opens(&cmds)[0].0,
+                err: OpenError::NotPresent,
+            },
+            now(1),
+        );
+        let cmds = c.on_timer(now(1001));
+        assert_eq!(opens(&cmds).len(), 1);
+        assert!(cmds.contains(&Command::Watch(vec!["/tmp/cmrd-late".into()])));
     }
 
     #[test]
