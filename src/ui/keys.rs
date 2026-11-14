@@ -28,8 +28,52 @@ fn scroll_focused(core: &mut Core, f: impl FnOnce(&mut crate::scrollback::Scroll
     }
 }
 
-/// Jump to the next/previous match relative to the current position.
-fn search_step(view: &View, core: &mut Core, forward: bool, inclusive: bool) {
+/// Search backward (toward older lines) from `from`, inclusive; wrap from the newest.
+fn find_older(
+    sb: &crate::scrollback::Scrollback,
+    needle: &str,
+    from: Option<usize>,
+) -> Option<usize> {
+    if sb.is_empty() {
+        return None;
+    }
+    let last = sb.len() - 1;
+    from.and_then(|f| sb.search(needle, f, false))
+        .or_else(|| sb.search(needle, last, false))
+}
+
+/// Search forward (toward newer lines) from `from`, inclusive; wrap from the oldest.
+fn find_newer(sb: &crate::scrollback::Scrollback, needle: &str, from: usize) -> Option<usize> {
+    sb.search(needle, from, true)
+        .or_else(|| sb.search(needle, 0, true))
+}
+
+/// Re-run the incremental search from the origin saved when `/` was pressed.
+/// An empty needle restores the origin view.
+fn search_incremental(view: &View, core: &mut Core) {
+    let i = core.focus();
+    let Some(t) = core.tabs_mut().get_mut(i) else {
+        return;
+    };
+    let origin = view.search_origin;
+    if view.search.is_empty() {
+        match origin {
+            Some((_, true)) => t.scroll.end(),
+            Some((pos, false)) => t.scroll.jump_to(pos),
+            None => {}
+        }
+        return;
+    }
+    let from = origin
+        .map(|(p, _)| p)
+        .unwrap_or_else(|| t.scroll.position());
+    if let Some(h) = find_older(&t.scroll, &view.search, Some(from)) {
+        t.scroll.jump_to(h);
+    }
+}
+
+/// `n` (older) / `N` (newer) relative to the current position, wrapping.
+fn search_step(view: &View, core: &mut Core, older: bool) {
     if view.search.is_empty() {
         return;
     }
@@ -38,13 +82,10 @@ fn search_step(view: &View, core: &mut Core, forward: bool, inclusive: bool) {
         return;
     };
     let pos = t.scroll.position();
-    let hit = if forward {
-        t.scroll
-            .search(&view.search, if inclusive { pos } else { pos + 1 }, true)
-    } else if pos == 0 {
-        None
+    let hit = if older {
+        find_older(&t.scroll, &view.search, pos.checked_sub(1))
     } else {
-        t.scroll.search(&view.search, pos - 1, false)
+        find_newer(&t.scroll, &view.search, pos + 1)
     };
     if let Some(h) = hit {
         t.scroll.jump_to(h);
@@ -63,6 +104,10 @@ pub fn on_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
         if view.mode == Mode::Log {
             view.search.clear();
         }
+        if view.mode == Mode::Search && view.search.is_empty() {
+            search_incremental(view, core);
+        }
+        view.search_origin = None;
         view.mode = Mode::Log;
         return UiOutcome::Redraw;
     }
@@ -120,14 +165,19 @@ fn log_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
         KeyCode::Char('/') => {
             view.mode = Mode::Search;
             view.search.clear();
+            let i = core.focus();
+            view.search_origin = core
+                .tabs()
+                .get(i)
+                .map(|t| (t.scroll.position(), t.scroll.follow()));
             UiOutcome::Redraw
         }
         KeyCode::Char('n') => {
-            search_step(view, core, true, false);
+            search_step(view, core, true);
             UiOutcome::Redraw
         }
         KeyCode::Char('N') => {
-            search_step(view, core, false, false);
+            search_step(view, core, false);
             UiOutcome::Redraw
         }
         KeyCode::Char('b') => {
@@ -232,15 +282,19 @@ fn search_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
     match key.code {
         KeyCode::Char(c) => {
             view.search.push(c);
-            search_step(view, core, true, true);
+            search_incremental(view, core);
             UiOutcome::Redraw
         }
         KeyCode::Backspace => {
             view.search.pop();
-            search_step(view, core, true, true);
+            search_incremental(view, core);
             UiOutcome::Redraw
         }
         KeyCode::Enter => {
+            if view.search.is_empty() {
+                search_incremental(view, core);
+            }
+            view.search_origin = None;
             view.mode = Mode::Log;
             UiOutcome::Redraw
         }
@@ -268,7 +322,7 @@ fn baud_key(view: &mut View, key: KeyEvent) -> UiOutcome {
             }
             UiOutcome::Redraw
         }
-        KeyCode::Backspace => {
+        KeyCode::Backspace if view.picker_idx == BAUDS.len() => {
             view.custom_baud.pop();
             UiOutcome::Redraw
         }
@@ -311,7 +365,10 @@ fn ports_key(view: &mut View, core: &Core, key: KeyEvent) -> UiOutcome {
     }
 }
 
-pub fn on_mouse(_view: &mut View, core: &mut Core, ev: MouseEvent) -> UiOutcome {
+pub fn on_mouse(view: &mut View, core: &mut Core, ev: MouseEvent) -> UiOutcome {
+    if matches!(view.mode, Mode::Help | Mode::BaudPicker | Mode::OtherPorts) {
+        return UiOutcome::None;
+    }
     match ev.kind {
         MouseEventKind::ScrollUp => {
             scroll_focused(core, |s| s.scroll_up(3));

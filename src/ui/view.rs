@@ -23,6 +23,8 @@ pub struct View {
     pub history: Vec<String>,
     pub hist_idx: Option<usize>,
     pub search: String,
+    /// Where `/` was pressed: (buffer position, was following).
+    pub search_origin: Option<(usize, bool)>,
     pub timestamps: bool,
     pub wrap: bool,
     pub picker_idx: usize,
@@ -42,6 +44,7 @@ impl Default for View {
             history: Vec::new(),
             hist_idx: None,
             search: String::new(),
+            search_origin: None,
             timestamps: true,
             wrap: true,
             picker_idx: 0,

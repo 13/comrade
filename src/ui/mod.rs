@@ -15,7 +15,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TLine, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::core::{Core, PauseReason, Tab, TabState};
 use crate::event::Holder;
@@ -289,12 +289,24 @@ fn render_send(f: &mut Frame, tab: Option<&Tab>, view: &View, r: Rect) {
         dim()
     };
     let lw = r.width.saturating_sub(rw + 1);
+    // Show the tail of the input so the cursor (at the end) stays visible.
+    let avail = (lw as usize).saturating_sub(prefix.width() + 2);
+    let mut tail_w = 0;
+    let mut start = text.len();
+    for (i, c) in text.char_indices().rev() {
+        let w = c.width().unwrap_or(0);
+        if tail_w + w > avail {
+            break;
+        }
+        tail_w += w;
+        start = i;
+    }
     f.render_widget(
-        Paragraph::new(format!("{prefix} {text}")).style(style),
+        Paragraph::new(format!("{prefix} {}", &text[start..])).style(style),
         Rect { width: lw, ..r },
     );
     if matches!(view.mode, Mode::Send | Mode::Search) && r.width > 0 && r.height > 0 {
-        let x = (prefix.width() + 1 + text.width()) as u16;
+        let x = (prefix.width() + 1 + tail_w) as u16;
         f.set_cursor_position((r.x + x.min(r.width - 1), r.y));
     }
 }
@@ -701,13 +713,129 @@ mod tests {
         for d in "needle".chars() {
             on_key(&mut v, &mut c, ch(d));
         }
-        assert_eq!(c.tabs()[0].scroll.position(), 1);
+        assert_eq!(
+            c.tabs()[0].scroll.position(),
+            3,
+            "nothing older: wraps to newest"
+        );
         on_key(&mut v, &mut c, key(KeyCode::Enter));
         assert_eq!(v.mode, Mode::Log);
         on_key(&mut v, &mut c, ch('n'));
-        assert_eq!(c.tabs()[0].scroll.position(), 3);
-        on_key(&mut v, &mut c, ch('N'));
         assert_eq!(c.tabs()[0].scroll.position(), 1);
+        on_key(&mut v, &mut c, ch('N'));
+        assert_eq!(c.tabs()[0].scroll.position(), 3);
+    }
+
+    fn follow_core(n: usize, hits: &[usize]) -> Core {
+        let mut c = core_with(1);
+        for i in 0..n {
+            let t = if hits.contains(&i) {
+                format!("needle {i}")
+            } else {
+                format!("l{i}")
+            };
+            c.tabs_mut()[0].scroll.push(line(&t, LineKind::Data));
+        }
+        c
+    }
+    fn type_str(v: &mut View, c: &mut Core, s: &str) {
+        for d in s.chars() {
+            on_key(v, c, ch(d));
+        }
+    }
+
+    #[test]
+    fn incremental_search_in_follow_state() {
+        let mut c = follow_core(100, &[10, 50]);
+        let mut v = View::new();
+        on_key(&mut v, &mut c, ch('/'));
+        type_str(&mut v, &mut c, "needle 1");
+        assert_eq!(c.tabs()[0].scroll.position(), 10);
+        // backspace to a shorter needle: newest match from origin
+        on_key(&mut v, &mut c, key(KeyCode::Backspace));
+        assert_eq!(c.tabs()[0].scroll.position(), 50);
+        // empty needle restores follow
+        for _ in 0..7 {
+            on_key(&mut v, &mut c, key(KeyCode::Backspace));
+        }
+        assert!(c.tabs()[0].scroll.follow());
+    }
+
+    #[test]
+    fn search_n_wraps_both_ways() {
+        let mut c = follow_core(100, &[10, 50]);
+        let mut v = View::new();
+        on_key(&mut v, &mut c, ch('/'));
+        type_str(&mut v, &mut c, "needle");
+        on_key(&mut v, &mut c, key(KeyCode::Enter));
+        assert_eq!(c.tabs()[0].scroll.position(), 50);
+        on_key(&mut v, &mut c, ch('n'));
+        assert_eq!(c.tabs()[0].scroll.position(), 10);
+        on_key(&mut v, &mut c, ch('n'));
+        assert_eq!(c.tabs()[0].scroll.position(), 50, "wrap to newest");
+        on_key(&mut v, &mut c, ch('N'));
+        assert_eq!(c.tabs()[0].scroll.position(), 10, "wrap to oldest");
+        on_key(&mut v, &mut c, ch('N'));
+        assert_eq!(c.tabs()[0].scroll.position(), 50);
+    }
+
+    #[test]
+    fn esc_empty_search_resumes_follow() {
+        let mut c = follow_core(20, &[]);
+        let mut v = View::new();
+        on_key(&mut v, &mut c, ch('/'));
+        on_key(&mut v, &mut c, key(KeyCode::Esc));
+        assert!(c.tabs()[0].scroll.follow());
+        assert_eq!(v.mode, Mode::Log);
+    }
+
+    #[test]
+    fn send_box_scrolls_horizontally() {
+        let c = core_with(1);
+        let mut v = View::new();
+        v.mode = Mode::Send;
+        v.input = "0123456789abcdefghijklmnopqrstuvwxyz".into();
+        let mut t = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        t.draw(|f| render(f, &c, &v)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let y = (0..10)
+            .find(|&y| {
+                (0..40)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("Enter sends")
+            })
+            .unwrap();
+        let row: String = (0..40).map(|x| buf[(x, y)].symbol()).collect();
+        assert!(row.contains("xyz"), "{row}");
+        assert!(!row.contains("0123"), "{row}");
+        let pos = t.get_cursor_position().unwrap();
+        assert_eq!(pos.y, y);
+        let idx = row.find("xyz").unwrap() + 3; // ascii only
+        assert_eq!(pos.x as usize, idx);
+    }
+
+    #[test]
+    fn overlay_ignores_wheel_and_baud_backspace() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut c = follow_core(30, &[]);
+        let mut v = View::new();
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        v.mode = Mode::Help;
+        assert_eq!(on_mouse(&mut v, &mut c, wheel), UiOutcome::None);
+        assert!(c.tabs()[0].scroll.follow());
+        v.mode = Mode::Log;
+        assert_eq!(on_mouse(&mut v, &mut c, wheel), UiOutcome::Redraw);
+        v.mode = Mode::BaudPicker;
+        v.picker_idx = 0;
+        v.custom_baud = "123".into();
+        on_key(&mut v, &mut c, key(KeyCode::Backspace));
+        assert_eq!(v.custom_baud, "123");
     }
 
     #[test]
