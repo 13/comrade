@@ -120,6 +120,10 @@ fn run(socket: udev::MonitorSocket, tx: Sender<Event>) {
             }
         }
     }
+    // Everything after this is a hotplug (Core resets ESP boards on plug).
+    if tx.send(Event::EnumerationDone).is_err() {
+        return;
+    }
     loop {
         let mut fds = [PollFd::new(socket.as_fd(), PollFlags::POLLIN)];
         match poll(&mut fds, PollTimeout::NONE) {

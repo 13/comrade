@@ -64,6 +64,9 @@ pub enum Event {
     ForeignReleased {
         devnode: PathBuf,
     },
+    /// The startup udev enumeration has been sent; later `DeviceAdded`
+    /// events are hotplugs.
+    EnumerationDone,
     Input(crossterm::event::Event),
 }
 

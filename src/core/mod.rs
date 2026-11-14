@@ -103,6 +103,8 @@ pub struct Core {
     next_conn: ConnId,
     last_watch: Vec<PathBuf>,
     pause: PauseTracker,
+    /// Set by `startup_done`: `DeviceAdded` is a hotplug, not enumeration.
+    hotplug: bool,
 }
 
 fn line(now: Now, kind: LineKind, text: String) -> Line {
@@ -119,6 +121,17 @@ fn separator(now: Now, label: &str) -> Line {
         LineKind::Separator,
         format!("──── {label} · {} ────", now.wall.format("%H:%M:%S")),
     )
+}
+
+/// ESP boards get a reset pulse when plugged in: ESP USB-Serial-JTAG, and
+/// UART bridges except Arduino's own (Uno/Mega 16U2 already reset on the
+/// DTR edge of the open).
+fn resets_on_plug(dev: &DeviceInfo, family: Family) -> bool {
+    match family {
+        Family::EspUsbJtag => true,
+        Family::UartBridge => !matches!(dev.vid, 0x2341 | 0x2a03),
+        Family::NativeCdc | Family::Unknown => false,
+    }
 }
 
 fn is_rom_banner(l: &Line) -> bool {
@@ -145,6 +158,7 @@ impl Core {
             next_conn: 1,
             last_watch: Vec::new(),
             pause: PauseTracker::new(),
+            hotplug: false,
         }
     }
 
@@ -207,6 +221,11 @@ impl Core {
             self.open_tab(idx, None, &mut cmds);
         }
         self.finish(cmds)
+    }
+
+    /// Startup enumeration is over: from now on `DeviceAdded` is a hotplug.
+    pub fn startup_done(&mut self) {
+        self.hotplug = true;
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
@@ -317,6 +336,7 @@ impl Core {
                 self.foreign_open(devnode, holder, now, &mut cmds)
             }
             Event::ForeignReleased { devnode } => self.foreign_released(devnode, now, &mut cmds),
+            Event::EnumerationDone => self.startup_done(),
             Event::Input(_) => {}
         }
         self.finish(cmds)
@@ -547,15 +567,25 @@ impl Core {
                 if self.owned_by_other(&key, &dev.devnode) {
                     return;
                 }
+                let tabs_before = self.tabs.len();
                 let idx = self.find_or_create(key, friendly_name(&dev), family, now);
-                self.attach(idx, dev.devnode, now, cmds);
+                let t = &self.tabs[idx];
+                // New tab, or back from an unplug, but not the return of a
+                // board that was uploading (esptool already reset it).
+                let fresh = self.tabs.len() > tabs_before
+                    || (t.state == TabState::Waiting && t.devnode.is_none() && !t.after_upload);
+                let opened = self.attach(idx, dev.devnode.clone(), now, cmds);
+                if opened && fresh && self.hotplug && resets_on_plug(&dev, family) {
+                    self.plug_reset(idx, now, cmds);
+                }
             }
         }
     }
 
     /// Points tab `idx` at the (re)appeared `devnode` and opens it when the
-    /// pause rules allow; otherwise it waits for `on_timer`.
-    fn attach(&mut self, idx: usize, devnode: PathBuf, now: Now, cmds: &mut Vec<Command>) {
+    /// pause rules allow; otherwise it waits for `on_timer`. Returns whether
+    /// it was opened.
+    fn attach(&mut self, idx: usize, devnode: PathBuf, now: Now, cmds: &mut Vec<Command>) -> bool {
         let held = self.pause.is_held(&devnode);
         let can_open = !held && self.pause.allows_auto_connect(now.mono);
         let t = &mut self.tabs[idx];
@@ -567,7 +597,10 @@ impl Core {
             TabState::Connecting | TabState::Connected if same_node => {}
             TabState::Paused(PauseReason::Manual) => t.devnode = Some(devnode),
             TabState::Paused(PauseReason::Upload(_)) if held => t.devnode = Some(devnode),
-            _ if can_open => self.open_tab(idx, Some(devnode), cmds),
+            _ if can_open => {
+                self.open_tab(idx, Some(devnode), cmds);
+                return true;
+            }
             // Live on another node; leave it alone while blocked.
             TabState::Connecting | TabState::Connected => {}
             // Blocked: wait for `on_timer` to open it.
@@ -577,6 +610,21 @@ impl Core {
                 t.await_unblock = true;
             }
         }
+        false
+    }
+
+    /// Reset pulse right after the `Open` of a plugged-in ESP board, so its
+    /// boot log is captured. The worker runs commands in order, so the
+    /// pulse happens on the open port.
+    fn plug_reset(&mut self, idx: usize, now: Now, cmds: &mut Vec<Command>) {
+        let t = &mut self.tabs[idx];
+        Self::flush_partial(t);
+        t.banner_quiet = BANNER_QUIET;
+        cmds.push(Command::ResetPulse {
+            key: t.key.clone(),
+            family: t.family,
+        });
+        t.scroll.push(separator(now, "reset"));
     }
 
     /// Key for a new Auto device. Normally `board_key`; but when that key's
@@ -2139,6 +2187,146 @@ mod tests {
         let l = t.scroll.get(0).unwrap();
         assert_eq!(l.text, "write timed out, 12 bytes dropped");
         assert_eq!(l.kind, LineKind::Info);
+    }
+
+    fn pulses(cmds: &[Command]) -> Vec<Family> {
+        cmds.iter()
+            .filter_map(|c| match c {
+                Command::ResetPulse { family, .. } => Some(*family),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn hotplug_core() -> Core {
+        let mut c = core();
+        c.startup_done();
+        c
+    }
+
+    #[test]
+    fn startup_add_does_not_pulse() {
+        let mut c = core();
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0")),
+            now(0),
+        );
+        assert_eq!(opens(&cmds).len(), 1);
+        assert!(pulses(&cmds).is_empty());
+        assert_eq!(seps(&c, "reset"), 0);
+    }
+
+    #[test]
+    fn hotplug_esp_bridge_is_reset_after_open() {
+        let mut c = hotplug_core();
+        let d = dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0");
+        let key = board_key(&d);
+        let cmds = c.handle(Event::DeviceAdded(d), now(0));
+        let kinds: Vec<&str> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Command::Open { .. } => Some("open"),
+                Command::ResetPulse { .. } => Some("pulse"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, vec!["open", "pulse"]);
+        assert!(cmds.contains(&Command::ResetPulse {
+            key,
+            family: Family::UartBridge
+        }));
+        assert_eq!(seps(&c, "reset"), 1);
+    }
+
+    #[test]
+    fn enumeration_done_event_ends_startup() {
+        let mut c = core();
+        c.handle(Event::EnumerationDone, now(0));
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x1a86, 0x7523, "C", "/dev/ttyUSB0")),
+            now(1),
+        );
+        assert_eq!(pulses(&cmds), vec![Family::UartBridge]);
+    }
+
+    #[test]
+    fn hotplug_esp_usb_jtag_is_reset() {
+        let mut c = hotplug_core();
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x303a, 0x1001, "S", "/dev/ttyACM0")),
+            now(0),
+        );
+        assert_eq!(pulses(&cmds), vec![Family::EspUsbJtag]);
+    }
+
+    #[test]
+    fn hotplug_arduino_bridge_and_native_usb_not_reset() {
+        let mut c = hotplug_core();
+        for (vid, pid, node) in [
+            (0x2341, 0x0043, "/dev/ttyACM0"),
+            (0x2a03, 0x0043, "/dev/ttyACM1"),
+            (0x2341, 0x8036, "/dev/ttyACM2"),
+            (0x2e8a, 0x000a, "/dev/ttyACM3"),
+        ] {
+            let cmds = c.handle(Event::DeviceAdded(dev(vid, pid, node, node)), now(0));
+            assert_eq!(opens(&cmds).len(), 1);
+            assert!(pulses(&cmds).is_empty(), "{vid:04x}:{pid:04x}");
+        }
+    }
+
+    #[test]
+    fn hotplug_replug_is_reset_but_upload_return_is_not() {
+        let mut c = hotplug_core();
+        let d = dev(0x303a, 0x1001, "S", "/dev/ttyACM0");
+        let (key, conn) = connect(&mut c, d.clone());
+        // Unplug and replug: reset again for the boot log.
+        removed(&mut c, "/dev/ttyACM0", 10);
+        let cmds = c.handle(Event::DeviceAdded(d.clone()), now(20));
+        assert_eq!(pulses(&cmds), vec![Family::EspUsbJtag]);
+        let conn2 = opens(&cmds)[0].0;
+        assert!(conn2 > conn);
+        c.handle(
+            Event::PortOpened {
+                key: key.clone(),
+                conn: conn2,
+            },
+            now(21),
+        );
+        // Upload: esptool resets the chip, the node re-enumerates.
+        foreign_open(&mut c, "/dev/ttyACM0", esptool(), 100);
+        removed(&mut c, "/dev/ttyACM0", 200);
+        foreign_released(&mut c, "/dev/ttyACM0", 300);
+        let cmds = c.handle(Event::DeviceAdded(d.clone()), now(1000));
+        assert_eq!(opens(&cmds).len(), 1);
+        assert!(pulses(&cmds).is_empty());
+        // A retry after a lost connection does not pulse either.
+        let conn3 = opens(&cmds)[0].0;
+        c.handle(
+            Event::PortOpened {
+                key: key.clone(),
+                conn: conn3,
+            },
+            now(1001),
+        );
+        gone(&mut c, &key, conn3, 1100);
+        let cmds = c.on_timer(now(2100));
+        assert_eq!(opens(&cmds).len(), 1);
+        assert!(pulses(&cmds).is_empty());
+    }
+
+    #[test]
+    fn blocked_hotplug_is_not_reset_when_opened_later() {
+        let mut c = hotplug_core();
+        foreign_open(&mut c, "/dev/ttyACM5", esptool(), 0);
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0")),
+            now(10),
+        );
+        assert!(opens(&cmds).is_empty());
+        foreign_released(&mut c, "/dev/ttyACM5", 20);
+        let cmds = c.on_timer(now(520));
+        assert_eq!(opens(&cmds).len(), 1);
+        assert!(pulses(&cmds).is_empty());
     }
 
     #[test]

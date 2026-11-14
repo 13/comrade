@@ -517,7 +517,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         app.view
             .set_status(format!("upload detection off (inotify: {e})"));
     }
+    // udev_watch sends Event::EnumerationDone after the startup
+    // enumeration; Core treats later adds as hotplugs. Without udev there
+    // are no adds at all.
     if let Err(e) = udev_watch::spawn(tx.clone()) {
+        app.core.startup_done();
         app.view
             .set_status(format!("hotplug detection off (udev: {e})"));
     }
