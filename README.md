@@ -88,6 +88,7 @@ comrade never clears the scrollback on its own. It keeps the last 100 000 lines 
 | `↑↓ PgUp PgDn Home End`, wheel | scroll / follow |
 | `/` `n` `N` | search |
 | `i` or `Enter` | focus send box |
+| `I` (shift) | raw mode: every key goes straight to the board |
 | `b` | baud picker (common rates 300…2 000 000 + custom) |
 | `p` | manual pause/resume |
 | `r` | reset board |
@@ -103,6 +104,8 @@ comrade never clears the scrollback on its own. It keeps the last 100 000 lines 
 When you scroll up, the view freezes and shows `+N new`. Press `End` to follow again.
 
 The saved log is plain text, with colour codes removed. Each line has an `HH:MM:SS.mmm` prefix while timestamps are on.
+
+**Raw mode** (`I`): comrade sends every key to the board at once, as a terminal would. Arrows, `Tab`, `Backspace` and `Ctrl`-letters all work, so you can use a shell or REPL on the board (MicroPython, the ESP-IDF console, Zephyr shell) with history and completion. `Enter` sends the tab's line ending (`\r` if it is set to none). Pasted text goes through too. `Ctrl-]` leaves raw mode. `Ctrl-C` and `q` go to the board, not to comrade.
 
 **Send box:**
 

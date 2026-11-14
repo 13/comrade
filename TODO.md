@@ -15,7 +15,7 @@ Items are grouped by priority. Each item has a check that tells you when it is d
 
 ## P1: features that matter most to users
 
-- [ ] **Raw pass-through mode.** Send every key straight to the port (arrows, Tab, Ctrl-C, history), with one escape key such as `Ctrl-]`. This is what you need for shells and REPLs on the board: the ESP-IDF console, MicroPython, Zephyr shell, bootloader prompts. The send box only sends whole lines today.
+- [x] **Raw pass-through mode.** Send every key straight to the port (arrows, Tab, Ctrl-C, history), with one escape key such as `Ctrl-]`. This is what you need for shells and REPLs on the board: the ESP-IDF console, MicroPython, Zephyr shell, bootloader prompts. The send box only sends whole lines today.
   Check: in a MicroPython REPL, Tab completion and Up-arrow history work.
 - [ ] **Text selection and copy.** comrade turns on mouse capture, which blocks the terminal's own selection (only Shift-drag works, and some terminals do not allow it). Add OSC 52 copy (already in the list below) and either a selection mode or a key that turns mouse capture off.
   Check: you can copy a line from the log into another program without leaving comrade.

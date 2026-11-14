@@ -12,6 +12,8 @@ pub enum Mode {
     #[default]
     Log,
     Send,
+    /// Every key goes straight to the board; `Ctrl-]` leaves.
+    Raw,
     Search,
     BaudPicker,
     OtherPorts,

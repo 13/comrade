@@ -422,6 +422,20 @@ fn render_log(f: &mut Frame, tab: Option<&Tab>, view: &View, r: Rect) {
 }
 
 fn render_send(f: &mut Frame, tab: Option<&Tab>, view: &View, r: Rect) {
+    if view.mode == Mode::Raw {
+        f.render_widget(
+            Paragraph::new(TLine::from(vec![
+                Span::styled(" ⌨", theme::warn().add_modifier(Modifier::BOLD)),
+                Span::raw(" "),
+                Span::styled(
+                    "raw mode: every key goes to the board, Ctrl-] leaves",
+                    theme::warn(),
+                ),
+            ])),
+            r,
+        );
+        return;
+    }
     let active = matches!(view.mode, Mode::Send | Mode::Search);
     let right: Vec<Span> = match view.mode {
         Mode::Search => vec![
@@ -488,6 +502,7 @@ fn mode_badge(mode: Mode) -> (&'static str, Color) {
     match mode {
         Mode::Log => (" LOG ", Color::Blue),
         Mode::Send => (" SEND ", Color::Green),
+        Mode::Raw => (" RAW ", Color::Red),
         Mode::Search => (" SEARCH ", Color::Yellow),
         Mode::BaudPicker => (" BAUD ", Color::Magenta),
         Mode::OtherPorts => (" PORTS ", Color::Magenta),
@@ -520,6 +535,7 @@ fn hints(view: &View, tab: Option<&Tab>) -> Vec<(&'static str, &'static str)> {
             ("↑↓", "history"),
             ("Esc", "back"),
         ],
+        Mode::Raw => vec![("^]", "leave raw mode")],
         Mode::Search => vec![("Enter", "keep"), ("Esc", "cancel")],
         Mode::BaudPicker | Mode::OtherPorts => {
             vec![("↑↓", "select"), ("Enter", "apply"), ("Esc", "cancel")]
@@ -538,6 +554,7 @@ fn hints(view: &View, tab: Option<&Tab>) -> Vec<(&'static str, &'static str)> {
                 ("?", "help"),
                 ("/", "search"),
                 ("i", "send"),
+                ("I", "raw"),
                 ("b", "baud"),
                 ("p", "pause"),
                 ("r", "reset"),
@@ -674,6 +691,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         "Board",
         &[
             ("i Enter", "focus send box"),
+            ("I", "raw mode: keys go to the board, Ctrl-] leaves"),
             ("b", "baud picker"),
             ("p", "pause / resume"),
             ("r", "reset board"),
@@ -893,6 +911,38 @@ mod tests {
     }
     fn ch(c: char) -> KeyEvent {
         key(KeyCode::Char(c))
+    }
+
+    #[test]
+    fn raw_mode_sends_keys_and_ctrl_bracket_leaves() {
+        let mut c = core_with(1);
+        let mut v = View::new();
+        assert_eq!(on_key(&mut v, &mut c, ch('I')), UiOutcome::Redraw);
+        assert_eq!(v.mode, Mode::Raw);
+        let send = |b: &[u8]| UiOutcome::Action(Action::SendRaw(b.to_vec()));
+        assert_eq!(on_key(&mut v, &mut c, ch('q')), send(b"q"));
+        assert_eq!(on_key(&mut v, &mut c, key(KeyCode::Up)), send(b"\x1b[A"));
+        assert_eq!(on_key(&mut v, &mut c, key(KeyCode::Tab)), send(b"\t"));
+        assert_eq!(on_key(&mut v, &mut c, key(KeyCode::Esc)), send(b"\x1b"));
+        let ctrl = |k| KeyEvent::new(k, KeyModifiers::CONTROL);
+        // Ctrl-C reaches the board instead of quitting comrade.
+        assert_eq!(on_key(&mut v, &mut c, ctrl(KeyCode::Char('c'))), send(&[3]));
+        assert_eq!(on_paste(&mut v, "a\nb"), send(b"a\rb"));
+        assert_eq!(
+            on_key(&mut v, &mut c, ctrl(KeyCode::Char(']'))),
+            UiOutcome::Redraw
+        );
+        assert_eq!(v.mode, Mode::Log);
+    }
+
+    #[test]
+    fn raw_mode_row_and_badge() {
+        let c = core_with(1);
+        let mut v = View::new();
+        v.mode = Mode::Raw;
+        let rows = draw(&c, &v, 80, 10);
+        assert!(rows.iter().any(|r| r.contains("RAW")));
+        assert!(rows.iter().any(|r| r.contains("Ctrl-] leaves")));
     }
 
     #[test]

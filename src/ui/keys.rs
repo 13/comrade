@@ -98,6 +98,9 @@ pub fn on_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
     if key.kind == KeyEventKind::Release {
         return UiOutcome::None;
     }
+    if view.mode == Mode::Raw {
+        return raw_key(view, core, key);
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     if ctrl && key.code == KeyCode::Char('c') {
         return UiOutcome::Quit;
@@ -116,6 +119,7 @@ pub fn on_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
     match view.mode {
         Mode::Log => log_key(view, core, key),
         Mode::Send => send_key(view, key),
+        Mode::Raw => UiOutcome::None,
         Mode::Search => search_key(view, core, key),
         Mode::BaudPicker => baud_key(view, key),
         Mode::OtherPorts => ports_key(view, core, key),
@@ -162,6 +166,10 @@ fn log_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
         KeyCode::Enter | KeyCode::Char('i') => {
             view.mode = Mode::Send;
             view.hist_idx = None;
+            UiOutcome::Redraw
+        }
+        KeyCode::Char('I') => {
+            view.mode = Mode::Raw;
             UiOutcome::Redraw
         }
         KeyCode::Char('/') => {
@@ -218,6 +226,56 @@ fn log_key(view: &mut View, core: &mut Core, key: KeyEvent) -> UiOutcome {
         }
         KeyCode::Char('q') => UiOutcome::Quit,
         _ => UiOutcome::None,
+    }
+}
+
+/// The bytes a key press sends to the board in raw mode, like a terminal
+/// would: control letters, arrows and Home/End as ANSI sequences.
+fn raw_bytes(core: &Core, key: KeyEvent) -> Vec<u8> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let mut out = match key.code {
+        KeyCode::Char(c) if ctrl && c.is_ascii_alphabetic() => {
+            vec![c.to_ascii_lowercase() as u8 - b'a' + 1]
+        }
+        KeyCode::Char('[') if ctrl => vec![0x1b],
+        KeyCode::Char('\\') if ctrl => vec![0x1c],
+        KeyCode::Char('^') if ctrl => vec![0x1e],
+        KeyCode::Char('_') if ctrl => vec![0x1f],
+        KeyCode::Char(c) => c.to_string().into_bytes(),
+        KeyCode::Enter => core.raw_enter().to_vec(),
+        KeyCode::Tab => b"\t".to_vec(),
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Up => b"\x1b[A".to_vec(),
+        KeyCode::Down => b"\x1b[B".to_vec(),
+        KeyCode::Right => b"\x1b[C".to_vec(),
+        KeyCode::Left => b"\x1b[D".to_vec(),
+        KeyCode::Home => b"\x1b[H".to_vec(),
+        KeyCode::End => b"\x1b[F".to_vec(),
+        KeyCode::Delete => b"\x1b[3~".to_vec(),
+        KeyCode::PageUp => b"\x1b[5~".to_vec(),
+        KeyCode::PageDown => b"\x1b[6~".to_vec(),
+        _ => return Vec::new(),
+    };
+    if alt && !out.is_empty() && !matches!(key.code, KeyCode::Esc) {
+        out.insert(0, 0x1b);
+    }
+    out
+}
+
+/// Raw mode: only `Ctrl-]` is kept for comrade; everything else is sent.
+fn raw_key(view: &mut View, core: &Core, key: KeyEvent) -> UiOutcome {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(']') {
+        view.mode = Mode::Log;
+        return UiOutcome::Redraw;
+    }
+    let bytes = raw_bytes(core, key);
+    if bytes.is_empty() {
+        UiOutcome::None
+    } else {
+        UiOutcome::Action(Action::SendRaw(bytes))
     }
 }
 
@@ -393,6 +451,10 @@ pub fn on_mouse(view: &mut View, core: &mut Core, ev: MouseEvent) -> UiOutcome {
 }
 
 pub fn on_paste(view: &mut View, s: &str) -> UiOutcome {
+    if view.mode == Mode::Raw {
+        let bytes: Vec<u8> = s.replace("\r\n", "\r").replace('\n', "\r").into_bytes();
+        return UiOutcome::Action(Action::SendRaw(bytes));
+    }
     if view.mode != Mode::Send {
         return UiOutcome::None;
     }

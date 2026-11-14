@@ -80,6 +80,8 @@ pub enum Action {
     NextTab,
     PrevTab,
     Send(String),
+    /// Bytes written as they are, with no line ending added.
+    SendRaw(Vec<u8>),
     SetBaud(u32),
     TogglePause,
     Reset,
@@ -369,6 +371,7 @@ impl Core {
                 }
             }
             Action::Send(s) => self.send(s, now, &mut cmds),
+            Action::SendRaw(b) => self.send_raw(b, &mut cmds),
             Action::SetBaud(baud) => {
                 if let Some(t) = self.tabs.get_mut(self.focus) {
                     t.baud = baud;
@@ -843,6 +846,29 @@ impl Core {
         });
     }
 
+    /// Write bytes from raw mode. A tab that is not connected drops them
+    /// silently: a note per key press would flood the scrollback.
+    fn send_raw(&mut self, bytes: Vec<u8>, cmds: &mut Vec<Command>) {
+        let Some(t) = self.tabs.get(self.focus) else {
+            return;
+        };
+        if t.state == TabState::Connected && !bytes.is_empty() {
+            cmds.push(Command::Write {
+                key: t.key.clone(),
+                bytes,
+            });
+        }
+    }
+
+    /// What the Enter key sends in raw mode, from the tab's line ending.
+    pub fn raw_enter(&self) -> &'static [u8] {
+        match self.tabs.get(self.focus).map(|t| t.line_ending) {
+            Some(LineEnding::Lf) => b"\n",
+            Some(LineEnding::CrLf) => b"\r\n",
+            _ => b"\r",
+        }
+    }
+
     fn persist(&mut self, cmds: &mut Vec<Command>) {
         let Some(t) = self.tabs.get(self.focus) else {
             return;
@@ -1159,6 +1185,27 @@ mod tests {
         let l = t.scroll.get(0).unwrap();
         assert_eq!(l.text, msg);
         assert_eq!(l.kind, LineKind::Error);
+    }
+
+    #[test]
+    fn send_raw_writes_bytes_unchanged_and_only_when_connected() {
+        let mut c = core();
+        let (key, _) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        let cmds = c.action(Action::SendRaw(vec![0x1b, b'[', b'A']), now(2));
+        assert_eq!(
+            cmds,
+            vec![Command::Write {
+                key,
+                bytes: vec![0x1b, b'[', b'A']
+            }]
+        );
+        assert_eq!(c.raw_enter(), b"\n");
+        c.action(Action::CycleLineEnding, now(3));
+        assert_eq!(c.raw_enter(), b"\r\n");
+        c.action(Action::CycleLineEnding, now(4));
+        assert_eq!(c.raw_enter(), b"\r");
+        let mut empty = core();
+        assert!(empty.action(Action::SendRaw(vec![b'x']), now(1)).is_empty());
     }
 
     #[test]
