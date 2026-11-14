@@ -167,15 +167,25 @@ fn bad_path_reports_open_failed() {
 
 #[test]
 fn set_baud_and_pulse_on_pty_do_not_kill_worker() {
-    let pty = make_pty();
-    let (h, rx) = start(&pty.path);
-    expect_opened(&rx);
-    h.set_baud(9600);
-    h.reset_pulse(Family::NativeCdc);
-    nix::unistd::write(&pty.master, b"ok").unwrap();
-    match rx.recv_timeout(WAIT).expect("data") {
-        Event::PortData { bytes, .. } => assert!(!bytes.is_empty()),
-        _ => panic!("expected data"),
+    for fam in [
+        Family::UartBridge,
+        Family::EspUsbJtag,
+        Family::NativeCdc,
+        Family::Unknown,
+    ] {
+        let pty = make_pty();
+        let (h, rx) = start(&pty.path);
+        expect_opened(&rx);
+        h.set_baud(9600);
+        h.reset_pulse(fam);
+        // queued behind the pulse: must still go out once it ends
+        h.write(b"w".to_vec());
+        nix::unistd::write(&pty.master, b"ok").unwrap();
+        match rx.recv_timeout(WAIT).expect("data") {
+            Event::PortData { bytes, .. } => assert!(!bytes.is_empty()),
+            _ => panic!("expected data"),
+        }
+        assert_eq!(read_master(&pty.master, 1), b"w", "{fam:?}");
     }
 }
 
@@ -232,7 +242,7 @@ fn close_is_fast_with_stuck_writes() {
 
 #[test]
 fn close_right_after_reset_pulse_is_fast() {
-    for fam in [Family::UartBridge, Family::NativeCdc] {
+    for fam in [Family::UartBridge, Family::EspUsbJtag, Family::Unknown] {
         let pty = make_pty();
         let (h, rx) = start(&pty.path);
         expect_opened(&rx);

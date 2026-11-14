@@ -362,7 +362,15 @@ impl Core {
             Action::TogglePause => self.toggle_pause(&mut cmds),
             Action::Reset => {
                 if let Some(t) = self.tabs.get_mut(self.focus) {
-                    if t.state == TabState::Connected {
+                    if t.family == Family::NativeCdc {
+                        // DTR/RTS do not reset these boards, and dropping
+                        // DTR would only pause `while (!Serial)` firmware.
+                        t.scroll.push(line(
+                            now,
+                            LineKind::Info,
+                            "reset not supported on native USB boards".into(),
+                        ));
+                    } else if t.state == TabState::Connected {
                         Self::flush_partial(t);
                         t.banner_quiet = BANNER_QUIET;
                         cmds.push(Command::ResetPulse {
@@ -1233,6 +1241,20 @@ mod tests {
             }]
         );
         assert!(texts(&c.tabs()[0])[0].starts_with("──── reset · "));
+    }
+
+    #[test]
+    fn reset_on_native_usb_is_not_supported() {
+        let mut c = core();
+        connect(&mut c, dev(0x2341, 0x8036, "L", "/dev/ttyACM0"));
+        let cmds = c.action(Action::Reset, now(2));
+        assert!(cmds.is_empty(), "{cmds:?}");
+        let v = texts(&c.tabs()[0]);
+        assert_eq!(
+            v,
+            vec!["reset not supported on native USB boards".to_string()]
+        );
+        assert_eq!(c.tabs()[0].scroll.get(0).unwrap().kind, LineKind::Info);
     }
 
     #[test]

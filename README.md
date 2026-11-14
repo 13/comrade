@@ -128,8 +128,12 @@ comrade never auto-connects bootloader PIDs. For Arduino (`2341`, `2a03`), Spark
 
 What `r` does depends on the family:
 
-- **UART bridge and ESP USB-Serial-JTAG:** comrade pulses RTS for 100 ms while DTR stays off. On ESP32 boards this resets the chip into normal run mode, with IO0 high.
-- **Native USB CDC and unknown ports:** comrade drops DTR for 50 ms.
+- **UART bridge:** comrade runs three steps, each one ioctl: DTR off and RTS on for 100 ms, then both off, then both on for 50 ms, then back to both off. On an ESP32 with the two-transistor auto-reset circuit, the first step holds EN low, and the second releases it with IO0 high, so the chip boots normally. Both lines on is neutral on that circuit. On an Uno or a CH340 Nano, the DTR-on edge in the third step resets the AVR through the DTR capacitor.
+- **ESP USB-Serial-JTAG:** comrade turns RTS on for 100 ms while DTR stays off.
+- **Native USB CDC:** `r` does nothing and the tab shows `reset not supported on native USB boards`. Lines do not reset these boards.
+- **Unknown ports (`--port`, `c`):** comrade drops DTR for 50 ms.
+
+Residual risk: an ESP board wired with DTR and RTS straight to EN and IO0, without the two transistors, sees "DTR on" as IO0 low. With such a board, the third step of the UART-bridge pulse can land the chip in download mode instead of a normal boot. Press the board's reset button if that happens.
 
 ## Upload pause
 

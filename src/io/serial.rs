@@ -287,22 +287,28 @@ fn open_port(devnode: &Path, baud: u32, policy: LinePolicy) -> Result<OwnedFd, O
     Ok(fd)
 }
 
-fn pulse_plan(family: Family, policy: LinePolicy) -> (LinePolicy, Duration) {
+/// Reset pulse as (lines, how long to hold them) steps, one TIOCMSET each.
+/// After the last step the worker restores the open policy.
+///
+/// - UART bridge: (DTR0,RTS1) 100 ms holds EN low on the ESP two-transistor
+///   circuit; (DTR0,RTS0) releases it with IO0 high, so the chip boots
+///   normally; (DTR1,RTS1) is neutral on that circuit but its DTR-assert
+///   edge resets an AVR (Uno, CH340 Nano) through the DTR capacitor.
+/// - ESP USB-Serial-JTAG: RTS only (the chip's own reset logic).
+/// - Native USB CDC: none; Core never sends a pulse for these.
+/// - Unknown (`--port`, `c`): drop DTR for 50 ms.
+fn pulse_plan(family: Family, policy: LinePolicy) -> Vec<(LinePolicy, Duration)> {
+    let l = |dtr, rts| LinePolicy { dtr, rts };
+    let ms = Duration::from_millis;
     match family {
-        Family::UartBridge | Family::EspUsbJtag => (
-            LinePolicy {
-                dtr: false,
-                rts: true,
-            },
-            Duration::from_millis(100),
-        ),
-        Family::NativeCdc | Family::Unknown => (
-            LinePolicy {
-                dtr: false,
-                rts: policy.rts,
-            },
-            Duration::from_millis(50),
-        ),
+        Family::UartBridge => vec![
+            (l(false, true), ms(100)),
+            (l(false, false), ms(0)),
+            (l(true, true), ms(50)),
+        ],
+        Family::EspUsbJtag => vec![(l(false, true), ms(100))],
+        Family::NativeCdc => Vec::new(),
+        Family::Unknown => vec![(l(false, policy.rts), ms(50))],
     }
 }
 
@@ -371,6 +377,9 @@ fn run(
     let mut pending: VecDeque<PortCmd> = VecDeque::new();
     let mut wbuf: VecDeque<u8> = VecDeque::new();
     let mut write_deadline: Option<Instant> = None;
+    // Reset pulse in flight: the remaining steps and when the current one
+    // ends. While it runs, later commands wait (Close still interrupts it).
+    let mut pulse_steps: VecDeque<(LinePolicy, Duration)> = VecDeque::new();
     let mut pulse_end: Option<Instant> = None;
     loop {
         // Run queued commands; a pulse in flight holds back later ones.
@@ -392,8 +401,11 @@ fn run(
                     let _ = set_baud(&fd, b);
                 }
                 PortCmd::ResetPulse(family) => {
-                    let (first, dur) = pulse_plan(family, policy);
-                    if let Err(e) = apply_lines(&fd, first) {
+                    pulse_steps = pulse_plan(family, policy).into();
+                    let Some((lines, dur)) = pulse_steps.pop_front() else {
+                        continue; // no pulse for this family
+                    };
+                    if let Err(e) = apply_lines(&fd, lines) {
                         return gone(format!("reset: {e}"));
                     }
                     pulse_end = Some(Instant::now() + dur);
@@ -402,9 +414,16 @@ fn run(
         }
         let now = Instant::now();
         if pulse_end.is_some_and(|d| now >= d) {
-            pulse_end = None;
-            write_deadline = Some(Instant::now() + WRITE_TIMEOUT);
-            if let Err(e) = apply_lines(&fd, policy) {
+            // Next step, or back to the open policy after the last one.
+            let (lines, end) = match pulse_steps.pop_front() {
+                Some((lines, dur)) => (lines, Some(now + dur)),
+                None => (policy, None),
+            };
+            pulse_end = end;
+            if end.is_none() {
+                write_deadline = Some(now + WRITE_TIMEOUT);
+            }
+            if let Err(e) = apply_lines(&fd, lines) {
                 return gone(format!("reset: {e}"));
             }
             continue;
@@ -537,10 +556,42 @@ mod tests {
         assert!(matches!(open_error(p, Errno::EBUSY), OpenError::Other(_)));
     }
 
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
     #[test]
-    fn pulse_plans() {
-        let pol = p(true, false);
-        assert_eq!(pulse_plan(Family::UartBridge, pol).0, p(false, true));
-        assert_eq!(pulse_plan(Family::NativeCdc, pol).0, p(false, false));
+    fn uart_bridge_pulse_resets_esp_and_avr() {
+        // EN low via RTS, release with IO0 high, then DTR-assert edge for
+        // AVR auto-reset with (1,1) neutral on the ESP two-transistor circuit.
+        assert_eq!(
+            pulse_plan(Family::UartBridge, p(false, false)),
+            vec![
+                (p(false, true), ms(100)),
+                (p(false, false), ms(0)),
+                (p(true, true), ms(50)),
+            ]
+        );
+    }
+
+    #[test]
+    fn esp_usb_jtag_pulse_is_rts_only() {
+        assert_eq!(
+            pulse_plan(Family::EspUsbJtag, p(false, false)),
+            vec![(p(false, true), ms(100))]
+        );
+    }
+
+    #[test]
+    fn native_cdc_has_no_pulse() {
+        assert!(pulse_plan(Family::NativeCdc, p(true, false)).is_empty());
+    }
+
+    #[test]
+    fn unknown_pulse_drops_dtr() {
+        assert_eq!(
+            pulse_plan(Family::Unknown, p(true, false)),
+            vec![(p(false, false), ms(50))]
+        );
     }
 }
