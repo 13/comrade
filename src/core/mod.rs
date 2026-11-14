@@ -51,6 +51,9 @@ pub struct Tab {
     data_this_conn: bool,
     /// Completed non-banner lines still to see before a banner counts as a new reset.
     banner_quiet: u8,
+    /// Node a foreign holder had open when this tab entered `Paused(Upload)`.
+    /// Kept after the node vanishes so the holder's release can be matched.
+    upload_node: Option<PathBuf>,
 }
 
 pub enum Action {
@@ -141,8 +144,27 @@ impl Core {
         self.other.iter().collect()
     }
 
-    pub fn on_timer(&mut self, _now: Now) -> Vec<Command> {
-        Vec::new()
+    /// Called when `next_deadline` passes: once auto-connect is allowed again,
+    /// open every present Auto board whose tab is waiting (or missing).
+    pub fn on_timer(&mut self, now: Now) -> Vec<Command> {
+        let mut cmds = Vec::new();
+        self.pause.on_timer(now.mono);
+        if self.pause.allows_auto_connect(now.mono) {
+            for dev in self.present_auto.clone() {
+                let Class::Auto(family) = classify(dev.vid, dev.pid) else {
+                    continue;
+                };
+                let key = board_key(&dev);
+                if self.suppressed.contains(&key) || self.owned_by_other(&key, &dev.devnode) {
+                    continue;
+                }
+                let idx = self.find_or_create(key, friendly_name(&dev), family, now);
+                if self.tabs[idx].state == TabState::Waiting {
+                    self.open_tab(idx, Some(dev.devnode), &mut cmds);
+                }
+            }
+        }
+        self.finish(cmds)
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
@@ -215,7 +237,11 @@ impl Core {
                     cmds.push(Command::Close { key });
                 }
             }
-            Event::ForeignOpen { .. } | Event::ForeignReleased { .. } | Event::Input(_) => {}
+            Event::ForeignOpen { devnode, holder } => {
+                self.foreign_open(devnode, holder, now, &mut cmds)
+            }
+            Event::ForeignReleased { devnode } => self.foreign_released(devnode, now, &mut cmds),
+            Event::Input(_) => {}
         }
         self.finish(cmds)
     }
@@ -362,6 +388,7 @@ impl Core {
             ever_connected: false,
             data_this_conn: false,
             banner_quiet: 0,
+            upload_node: None,
         });
         let idx = self.tabs.len() - 1;
         if self.tabs.len() > 1 && focused_connected {
@@ -407,22 +434,24 @@ impl Core {
                     return;
                 }
                 // A tab (e.g. a --port one) already owns this node.
-                if self
-                    .tabs
-                    .iter()
-                    .any(|t| t.key != key && t.devnode.as_ref() == Some(&dev.devnode))
-                {
+                if self.owned_by_other(&key, &dev.devnode) {
                     return;
                 }
                 let idx = self.find_or_create(key, friendly_name(&dev), family, now);
+                let held = self.pause.is_held(&dev.devnode);
                 let t = &mut self.tabs[idx];
                 let same_node = t.devnode.as_ref() == Some(&dev.devnode);
                 t.devnode = Some(dev.devnode.clone());
                 match t.state {
                     TabState::Connecting | TabState::Connected if same_node => {}
                     TabState::Paused(PauseReason::Manual) => {}
+                    TabState::Paused(PauseReason::Upload(_)) if held => {}
                     _ if self.pause.allows_auto_connect(now.mono) => {
                         self.open_tab(idx, Some(dev.devnode), cmds);
+                    }
+                    // Blocked: wait for `on_timer` to open it.
+                    TabState::Paused(PauseReason::Upload(_)) | TabState::Error(_) => {
+                        t.state = TabState::Waiting;
                     }
                     _ => {}
                 }
@@ -452,9 +481,69 @@ impl Core {
                 t.conn = 0;
                 cmds.push(Command::Close { key: t.key.clone() });
             }
-            TabState::Paused(PauseReason::Manual) => t.devnode = None,
+            // Upload pauses end when the holder releases, not on unplug.
+            TabState::Paused(_) => t.devnode = None,
             _ => {
                 t.devnode = None;
+                t.state = TabState::Waiting;
+            }
+        }
+    }
+
+    /// Whether a tab with a different key already holds `devnode`.
+    fn owned_by_other(&self, key: &BoardKey, devnode: &PathBuf) -> bool {
+        self.tabs
+            .iter()
+            .any(|t| &t.key != key && t.devnode.as_ref() == Some(devnode))
+    }
+
+    fn foreign_open(
+        &mut self,
+        devnode: PathBuf,
+        holder: Holder,
+        now: Now,
+        cmds: &mut Vec<Command>,
+    ) {
+        self.pause.foreign_open(&devnode, holder.clone(), now.mono);
+        let Some(t) = self
+            .tabs
+            .iter_mut()
+            .find(|t| t.devnode.as_ref() == Some(&devnode))
+        else {
+            return;
+        };
+        match t.state {
+            TabState::Paused(PauseReason::Manual) => return,
+            TabState::Connecting | TabState::Connected => {
+                Self::flush_partial(t);
+                t.conn = 0;
+                cmds.push(Command::Close { key: t.key.clone() });
+                t.scroll.push(separator(now, "upload"));
+            }
+            _ => {}
+        }
+        t.state = TabState::Paused(PauseReason::Upload(holder));
+        t.upload_node = Some(devnode);
+    }
+
+    fn foreign_released(&mut self, devnode: PathBuf, now: Now, cmds: &mut Vec<Command>) {
+        self.pause.foreign_released(&devnode, now.mono);
+        if self.pause.is_held(&devnode) {
+            return;
+        }
+        for idx in 0..self.tabs.len() {
+            let t = &mut self.tabs[idx];
+            if !matches!(t.state, TabState::Paused(PauseReason::Upload(_)))
+                || t.upload_node.as_ref() != Some(&devnode)
+            {
+                continue;
+            }
+            t.upload_node = None;
+            if t.devnode.as_ref() == Some(&devnode) {
+                // Same node still present: reopen at once to catch the boot log.
+                self.open_tab(idx, None, cmds);
+            } else {
+                // Node vanished (re-enumeration, failed upload, unplug).
                 t.state = TabState::Waiting;
             }
         }
@@ -581,9 +670,15 @@ mod tests {
         }
     }
 
+    /// Fixed monotonic base so `now(a)` and `now(b)` differ by exactly `b - a` ms.
+    fn base() -> Instant {
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *BASE.get_or_init(Instant::now)
+    }
+
     fn now(ms: u64) -> Now {
         Now {
-            mono: Instant::now() + Duration::from_millis(ms),
+            mono: base() + Duration::from_millis(ms),
             wall: chrono::Local::now(),
         }
     }
@@ -1184,5 +1279,259 @@ mod tests {
         let cmds = c.handle(Event::DeviceAdded(d), now(3));
         assert!(opens(&cmds).is_empty());
         assert_eq!(c.tabs()[0].state, TabState::Connected);
+    }
+
+    // ---- upload pause (Task 5) ----
+
+    fn esptool() -> Holder {
+        Holder::Named {
+            pid: 4121,
+            comm: "esptool".into(),
+        }
+    }
+
+    fn foreign_open(c: &mut Core, node: &str, holder: Holder, ms: u64) -> Vec<Command> {
+        c.handle(
+            Event::ForeignOpen {
+                devnode: node.into(),
+                holder,
+            },
+            now(ms),
+        )
+    }
+
+    fn foreign_released(c: &mut Core, node: &str, ms: u64) -> Vec<Command> {
+        c.handle(
+            Event::ForeignReleased {
+                devnode: node.into(),
+            },
+            now(ms),
+        )
+    }
+
+    fn removed(c: &mut Core, node: &str, ms: u64) -> Vec<Command> {
+        c.handle(
+            Event::DeviceRemoved {
+                devnode: node.into(),
+            },
+            now(ms),
+        )
+    }
+
+    #[test]
+    fn same_node_reopens_immediately() {
+        let mut c = core();
+        let (key, conn) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        let cmds = foreign_open(&mut c, "/dev/ttyUSB0", esptool(), 2);
+        assert!(cmds.contains(&Command::Close { key: key.clone() }));
+        assert!(opens(&cmds).is_empty());
+        assert_eq!(
+            c.tabs()[0].state,
+            TabState::Paused(PauseReason::Upload(esptool()))
+        );
+        assert_eq!(c.tabs()[0].conn, 0);
+        let v = texts(&c.tabs()[0]);
+        assert!(v.last().unwrap().starts_with("──── upload · "), "{v:?}");
+        assert!(v.last().unwrap().ends_with(" ────"));
+        let cmds = foreign_released(&mut c, "/dev/ttyUSB0", 7);
+        let o = opens(&cmds);
+        assert_eq!(o.len(), 1);
+        assert!(o[0].0 > conn);
+        assert_eq!(o[0].1, PathBuf::from("/dev/ttyUSB0"));
+        assert_eq!(c.tabs()[0].state, TabState::Connecting);
+        // The new conn is live; the old one stays stale.
+        c.handle(
+            Event::PortOpened {
+                key: key.clone(),
+                conn: o[0].0,
+            },
+            now(8),
+        );
+        assert_eq!(c.tabs()[0].state, TabState::Connected);
+    }
+
+    #[test]
+    fn repeated_foreign_open_one_separator_one_close() {
+        let mut c = core();
+        let (key, _) = connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        foreign_open(&mut c, "/dev/ttyUSB0", esptool(), 2);
+        let cmds = foreign_open(&mut c, "/dev/ttyUSB0", esptool(), 3);
+        assert!(!cmds.contains(&Command::Close { key }));
+        assert_eq!(seps(&c, "upload"), 1);
+    }
+
+    #[test]
+    fn foreign_open_while_connecting_closes_and_invalidates_conn() {
+        let mut c = core();
+        let d = dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0");
+        let key = board_key(&d);
+        let cmds = c.handle(Event::DeviceAdded(d), now(0));
+        let conn = opens(&cmds)[0].0;
+        let cmds = foreign_open(&mut c, "/dev/ttyUSB0", esptool(), 1);
+        assert!(cmds.contains(&Command::Close { key: key.clone() }));
+        c.handle(Event::PortOpened { key, conn }, now(2));
+        assert_eq!(
+            c.tabs()[0].state,
+            TabState::Paused(PauseReason::Upload(esptool()))
+        );
+    }
+
+    #[test]
+    fn reenumeration_waits_quiet_period() {
+        let mut c = core();
+        connect(&mut c, dev(0x2341, 0x8036, "L", "/dev/ttyACM0"));
+        foreign_open(&mut c, "/dev/ttyACM0", esptool(), 10);
+        let cmds = removed(&mut c, "/dev/ttyACM0", 20);
+        assert!(opens(&cmds).is_empty());
+        assert_eq!(
+            c.tabs()[0].state,
+            TabState::Paused(PauseReason::Upload(esptool()))
+        );
+        assert_eq!(c.tabs()[0].devnode, None);
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x2341, 0x0036, "L", "/dev/ttyACM1")),
+            now(30),
+        );
+        assert!(opens(&cmds).is_empty());
+        assert_eq!(c.tabs().len(), 1);
+        removed(&mut c, "/dev/ttyACM1", 900);
+        let cmds = foreign_released(&mut c, "/dev/ttyACM0", 1000);
+        assert!(opens(&cmds).is_empty());
+        assert_eq!(c.tabs()[0].state, TabState::Waiting);
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x2341, 0x8036, "L", "/dev/ttyACM0")),
+            now(1100),
+        );
+        assert!(opens(&cmds).is_empty());
+        assert_eq!(c.tabs()[0].state, TabState::Waiting);
+        assert_eq!(c.tabs()[0].devnode, Some("/dev/ttyACM0".into()));
+        assert_eq!(c.next_deadline(), Some(now(1500).mono));
+        let cmds = c.on_timer(now(1499));
+        assert!(opens(&cmds).is_empty());
+        let cmds = c.on_timer(now(1500));
+        let o = opens(&cmds);
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].1, PathBuf::from("/dev/ttyACM0"));
+        assert_eq!(c.tabs()[0].state, TabState::Connecting);
+        assert_eq!(c.next_deadline(), None);
+    }
+
+    #[test]
+    fn failed_upload_unblocks() {
+        let mut c = core();
+        connect(&mut c, dev(0x2341, 0x8036, "L", "/dev/ttyACM0"));
+        foreign_open(&mut c, "/dev/ttyACM0", esptool(), 10);
+        removed(&mut c, "/dev/ttyACM0", 20);
+        foreign_released(&mut c, "/dev/ttyACM0", 1000);
+        let cmds = c.on_timer(now(1500));
+        assert!(opens(&cmds).is_empty());
+        assert_eq!(c.tabs()[0].state, TabState::Waiting);
+        assert!(c.pause.allows_auto_connect(now(1500).mono));
+        assert_eq!(c.next_deadline(), None);
+    }
+
+    #[test]
+    fn stuck_holder_safety_net() {
+        let mut c = core();
+        connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        foreign_open(&mut c, "/dev/ttyUSB0", esptool(), 0);
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x1a86, 0x7523, "B", "/dev/ttyUSB1")),
+            now(1000),
+        );
+        assert!(opens(&cmds).is_empty());
+        assert_eq!(c.tabs()[1].state, TabState::Waiting);
+        assert_eq!(c.next_deadline(), Some(now(60_000).mono));
+        let cmds = c.on_timer(now(60_000));
+        let o = opens(&cmds);
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].1, PathBuf::from("/dev/ttyUSB1"));
+        assert_eq!(
+            c.tabs()[0].state,
+            TabState::Paused(PauseReason::Upload(esptool()))
+        );
+        assert_eq!(c.next_deadline(), None);
+    }
+
+    #[test]
+    fn unknown_holder_label() {
+        let mut c = core();
+        connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        foreign_open(&mut c, "/dev/ttyUSB0", Holder::Unknown, 2);
+        assert_eq!(
+            c.tabs()[0].state,
+            TabState::Paused(PauseReason::Upload(Holder::Unknown))
+        );
+    }
+
+    #[test]
+    fn manual_pause_not_auto_resumed() {
+        let mut c = core();
+        connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        c.action(Action::TogglePause, now(2));
+        let cmds = foreign_open(&mut c, "/dev/ttyUSB0", esptool(), 3);
+        assert!(cmds.is_empty());
+        assert_eq!(c.tabs()[0].state, TabState::Paused(PauseReason::Manual));
+        assert_eq!(seps(&c, "upload"), 0);
+        let cmds = foreign_released(&mut c, "/dev/ttyUSB0", 10);
+        assert!(opens(&cmds).is_empty());
+        let cmds = c.on_timer(now(510));
+        assert!(opens(&cmds).is_empty());
+        assert_eq!(c.tabs()[0].state, TabState::Paused(PauseReason::Manual));
+    }
+
+    #[test]
+    fn foreign_open_on_unowned_node_still_blocks() {
+        let mut c = core();
+        foreign_open(&mut c, "/dev/ttyACM5", Holder::Unknown, 0);
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0")),
+            now(1),
+        );
+        assert!(opens(&cmds).is_empty());
+        assert_eq!(c.tabs()[0].state, TabState::Waiting);
+    }
+
+    #[test]
+    fn release_reopens_same_node_even_if_other_node_held() {
+        let mut c = core();
+        connect(&mut c, dev(0x10c4, 0xea60, "A", "/dev/ttyUSB0"));
+        foreign_open(&mut c, "/dev/ttyUSB0", esptool(), 2);
+        foreign_open(&mut c, "/dev/ttyACM5", Holder::Unknown, 3);
+        let cmds = foreign_released(&mut c, "/dev/ttyUSB0", 4);
+        assert_eq!(opens(&cmds).len(), 1);
+    }
+
+    #[test]
+    fn reappearing_while_holder_alive_waits_for_release() {
+        let mut c = core();
+        connect(&mut c, dev(0x2341, 0x8036, "L", "/dev/ttyACM0"));
+        foreign_open(&mut c, "/dev/ttyACM0", esptool(), 10);
+        removed(&mut c, "/dev/ttyACM0", 20);
+        // Holder still recorded on the vanished node; board returns on a new node.
+        let cmds = c.handle(
+            Event::DeviceAdded(dev(0x2341, 0x8036, "L", "/dev/ttyACM1")),
+            now(30),
+        );
+        assert!(opens(&cmds).is_empty());
+        assert_eq!(c.tabs()[0].devnode, Some("/dev/ttyACM1".into()));
+        assert_eq!(c.tabs()[0].state, TabState::Waiting);
+        foreign_released(&mut c, "/dev/ttyACM0", 1000);
+        let cmds = c.on_timer(now(1500));
+        assert_eq!(opens(&cmds).len(), 1);
+    }
+
+    #[test]
+    fn on_timer_never_opens_bootloader() {
+        let mut c = core();
+        foreign_open(&mut c, "/dev/ttyACM9", Holder::Unknown, 0);
+        c.handle(
+            Event::DeviceAdded(dev(0x2341, 0x0036, "B", "/dev/ttyACM0")),
+            now(1),
+        );
+        foreign_released(&mut c, "/dev/ttyACM9", 2);
+        let cmds = c.on_timer(now(502));
+        assert!(opens(&cmds).is_empty());
+        assert!(c.tabs().is_empty());
     }
 }
