@@ -144,6 +144,11 @@ impl Core {
         self.focus
     }
 
+    /// Per-board preferences as loaded and updated by `Persist`.
+    pub fn prefs(&self) -> &HashMap<BoardKey, BoardPrefs> {
+        &self.prefs
+    }
+
     pub fn other_ports(&self) -> Vec<&DeviceInfo> {
         self.other.iter().collect()
     }
@@ -168,6 +173,18 @@ impl Core {
                 let idx = self.find_or_create(key, friendly_name(&dev), family, now);
                 if self.tabs[idx].state == TabState::Waiting {
                     self.open_tab(idx, Some(dev.devnode), &mut cmds);
+                }
+            }
+            // `--port` and `c` tabs are not udev-tracked: after an upload
+            // pause they wait here with their node kept (see
+            // `foreign_released`) and reopen once the quiet period is over.
+            for idx in 0..self.tabs.len() {
+                let t = &self.tabs[idx];
+                let resumable = t.family == Family::Unknown
+                    && t.state == TabState::Waiting
+                    && t.devnode.as_ref().is_some_and(|n| !self.pause.is_held(n));
+                if resumable {
+                    self.open_tab(idx, None, &mut cmds);
                 }
             }
         }
@@ -1496,6 +1513,39 @@ mod tests {
         let cmds = c.on_timer(now(510));
         assert!(opens(&cmds).is_empty());
         assert_eq!(c.tabs()[0].state, TabState::Paused(PauseReason::Manual));
+    }
+
+    #[test]
+    fn manual_port_resumes_after_upload_quiet_period() {
+        let mut c = Core::new(HashMap::new(), 115_200, vec!["/tmp/cmrd".into()]);
+        let conn = opens(&c.startup(now(0)))[0].0;
+        let key = c.tabs()[0].key.clone();
+        c.handle(Event::PortOpened { key, conn }, now(1));
+        foreign_open(&mut c, "/tmp/cmrd", esptool(), 2);
+        assert!(matches!(c.tabs()[0].state, TabState::Paused(_)));
+        let cmds = foreign_released(&mut c, "/tmp/cmrd", 10);
+        assert!(opens(&cmds).is_empty());
+        assert_eq!(c.tabs()[0].state, TabState::Waiting);
+        assert!(opens(&c.on_timer(now(100))).is_empty());
+        assert_eq!(c.next_deadline(), Some(now(510).mono));
+        let cmds = c.on_timer(now(510));
+        assert_eq!(opens(&cmds).len(), 1);
+        assert_eq!(opens(&cmds)[0].1, PathBuf::from("/tmp/cmrd"));
+        assert_eq!(c.tabs()[0].state, TabState::Connecting);
+        assert_eq!(seps(&c, "upload"), 1);
+    }
+
+    #[test]
+    fn manual_port_not_resumed_while_held() {
+        let mut c = Core::new(HashMap::new(), 115_200, vec!["/tmp/cmrd".into()]);
+        let conn = opens(&c.startup(now(0)))[0].0;
+        let key = c.tabs()[0].key.clone();
+        c.handle(Event::PortOpened { key, conn }, now(1));
+        foreign_open(&mut c, "/tmp/cmrd", esptool(), 2);
+        // Safety net lifts the global block, but this node is still held.
+        let cmds = c.on_timer(now(61_000));
+        assert!(opens(&cmds).is_empty());
+        assert!(matches!(c.tabs()[0].state, TabState::Paused(_)));
     }
 
     #[test]

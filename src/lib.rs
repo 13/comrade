@@ -1,5 +1,4 @@
-#![allow(dead_code)] // later tasks wire these up
-
+pub mod app;
 pub mod board;
 pub mod core;
 pub mod event;
