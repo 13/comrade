@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::ops::Range;
 
 use unicode_width::UnicodeWidthChar;
 
@@ -67,6 +68,24 @@ pub fn row_count(text: &str, width: usize) -> usize {
     rows
 }
 
+/// Byte ranges of `text` (SGR-stripped) for each wrapped row at `width`
+/// columns. Same greedy rule as `row_count`, so lengths always agree.
+pub fn wrap_segments(text: &str, width: u16) -> Vec<Range<usize>> {
+    let width = (width as usize).max(1);
+    let (mut out, mut start, mut cur) = (Vec::new(), 0, 0);
+    for (i, c) in text.char_indices() {
+        let w = c.width().unwrap_or(0);
+        if cur + w > width && cur > 0 {
+            out.push(start..i);
+            start = i;
+            cur = 0;
+        }
+        cur += w;
+    }
+    out.push(start..text.len());
+    out
+}
+
 impl Scrollback {
     pub fn new(cap: usize) -> Self {
         Self {
@@ -117,6 +136,16 @@ impl Scrollback {
 
     pub fn new_since_freeze(&self) -> usize {
         self.new_since_freeze
+    }
+
+    /// Buffer index of the bottom-most visible line (last line when following).
+    pub fn position(&self) -> usize {
+        if self.follow {
+            self.lines.len().saturating_sub(1)
+        } else {
+            (self.anchor.saturating_sub(self.dropped) as usize)
+                .min(self.lines.len().saturating_sub(1))
+        }
     }
 
     fn last_abs(&self) -> u64 {
@@ -290,6 +319,37 @@ mod tests {
         }
         s
     }
+    #[test]
+    fn wrap_segments_matches_row_count() {
+        for t in [
+            "",
+            "abc",
+            "abcdefghij",
+            "日本語テキスト",
+            "a日b日c",
+            "x\u{0301}yz",
+        ] {
+            for w in 0u16..12 {
+                let segs = wrap_segments(t, w);
+                assert_eq!(segs.len(), row_count(t, w as usize), "{t:?} w={w}");
+                assert_eq!(segs.first().map(|r| r.start), Some(0));
+                assert_eq!(segs.last().map(|r| r.end), Some(t.len()));
+                for p in segs.windows(2) {
+                    assert_eq!(p[0].end, p[1].start);
+                }
+            }
+        }
+        assert_eq!(wrap_segments("abcd", 2), vec![0..2, 2..4]);
+    }
+
+    #[test]
+    fn position_tracks_anchor() {
+        let mut s = filled(10);
+        assert_eq!(s.position(), 9);
+        s.jump_to(4);
+        assert_eq!(s.position(), 4);
+    }
+
     fn texts(v: &[VisibleRow]) -> Vec<String> {
         v.iter().map(|r| r.line.text.clone()).collect()
     }

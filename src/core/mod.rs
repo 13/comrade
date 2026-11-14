@@ -59,6 +59,7 @@ pub struct Tab {
     after_upload: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Focus(usize),
     NextTab,
