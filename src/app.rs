@@ -55,6 +55,12 @@ pub struct Args {
     /// Also append every tab's lines to a file in this directory as they arrive.
     #[arg(long, value_name = "DIR")]
     pub log_dir: Option<PathBuf>,
+    /// Print a shell completion script and exit.
+    #[arg(long, value_name = "SHELL")]
+    pub completions: Option<clap_complete::Shell>,
+    /// Print the man page (roff) and exit.
+    #[arg(long)]
+    pub man: bool,
 }
 
 /// A running port worker and what it was opened with.
