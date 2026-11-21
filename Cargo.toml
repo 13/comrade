@@ -14,7 +14,7 @@ crossbeam-channel = "0.5.17"
 crossterm = "0.29.0"
 directories = "6.0.0"
 inotify = "0.11.5"
-nix = { version = "0.31.3", features = ["poll", "event", "signal", "term", "fs", "ioctl", "user"] }
+nix = { version = "0.32.0", features = ["poll", "event", "signal", "term", "fs", "ioctl", "user"] }
 ratatui = "0.30.2"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
